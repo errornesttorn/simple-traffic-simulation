@@ -202,6 +202,8 @@ type DebugBlameLink struct {
 
 type SavedSplineFile struct {
 	Splines []SavedSpline `json:"splines"`
+	Routes  []SavedRoute  `json:"routes,omitempty"`
+	Cars    []SavedCar    `json:"cars,omitempty"`
 }
 
 type SavedSpline struct {
@@ -211,6 +213,26 @@ type SavedSpline struct {
 	P1       rl.Vector2 `json:"p1"`
 	P2       rl.Vector2 `json:"p2"`
 	P3       rl.Vector2 `json:"p3"`
+}
+
+type SavedRoute struct {
+	ID             int     `json:"id"`
+	StartSplineID  int     `json:"start_spline_id"`
+	EndSplineID    int     `json:"end_spline_id"`
+	PathIDs        []int   `json:"path_ids"`
+	SpawnPerMinute float32 `json:"spawn_per_minute"`
+}
+
+type SavedCar struct {
+	RouteID             int     `json:"route_id"`
+	CurrentSplineID     int     `json:"current_spline_id"`
+	DestinationSplineID int     `json:"destination_spline_id"`
+	DistanceOnSpline    float32 `json:"distance_on_spline"`
+	Speed               float32 `json:"speed"`
+	MaxSpeed            float32 `json:"max_speed"`
+	Accel               float32 `json:"accel"`
+	Length              float32 `json:"length"`
+	Width               float32 `json:"width"`
 }
 
 func main() {
@@ -300,10 +322,10 @@ func main() {
 				noticeText = fmt.Sprintf("Save failed: %v", err)
 				noticeTimer = 3.0
 			} else if path != "" {
-				if err := saveSplineFile(splines, path); err != nil {
+				if err := saveSplineFile(splines, routes, cars, path); err != nil {
 					noticeText = fmt.Sprintf("Save failed: %v", err)
 				} else {
-					noticeText = fmt.Sprintf("Saved %d splines to %s", len(splines), path)
+					noticeText = fmt.Sprintf("Saved %d splines, %d routes, %d cars to %s", len(splines), len(routes), len(cars), path)
 				}
 				noticeTimer = 3.0
 			}
@@ -314,20 +336,21 @@ func main() {
 				noticeText = fmt.Sprintf("Load failed: %v", err)
 				noticeTimer = 3.0
 			} else if path != "" {
-				loadedSplines, loadedNextSplineID, err := loadSplineFile(path)
+				loadedSplines, loadedRoutes, loadedCars, loadedNextSplineID, loadedNextRouteID, err := loadSplineFile(path)
 				if err != nil {
 					noticeText = fmt.Sprintf("Load failed: %v", err)
 					noticeTimer = 3.0
 				} else {
 					splines = loadedSplines
-					routes = routes[:0]
-					cars = cars[:0]
+					routes = loadedRoutes
+					cars = loadedCars
 					stage = StageIdle
 					draft = newDraft()
 					routePanel = RoutePanel{}
 					routeStartSplineID = -1
 					nextSplineID = loadedNextSplineID
-					noticeText = fmt.Sprintf("Loaded %d splines from %s", len(splines), path)
+					nextRouteID = loadedNextRouteID
+					noticeText = fmt.Sprintf("Loaded %d splines, %d routes, %d cars from %s", len(splines), len(routes), len(cars), path)
 					noticeTimer = 3.0
 				}
 			}
@@ -1825,8 +1848,12 @@ func normalizePickedPath(path string, save bool) string {
 	return path
 }
 
-func saveSplineFile(splines []Spline, path string) error {
-	saved := SavedSplineFile{Splines: make([]SavedSpline, 0, len(splines))}
+func saveSplineFile(splines []Spline, routes []Route, cars []Car, path string) error {
+	saved := SavedSplineFile{
+		Splines: make([]SavedSpline, 0, len(splines)),
+		Routes:  make([]SavedRoute, 0, len(routes)),
+		Cars:    make([]SavedCar, 0, len(cars)),
+	}
 	for _, spline := range splines {
 		saved.Splines = append(saved.Splines, SavedSpline{
 			ID:       spline.ID,
@@ -1837,6 +1864,28 @@ func saveSplineFile(splines []Spline, path string) error {
 			P3:       spline.P3,
 		})
 	}
+	for _, route := range routes {
+		saved.Routes = append(saved.Routes, SavedRoute{
+			ID:             route.ID,
+			StartSplineID:  route.StartSplineID,
+			EndSplineID:    route.EndSplineID,
+			PathIDs:        route.PathIDs,
+			SpawnPerMinute: route.SpawnPerMinute,
+		})
+	}
+	for _, car := range cars {
+		saved.Cars = append(saved.Cars, SavedCar{
+			RouteID:             car.RouteID,
+			CurrentSplineID:     car.CurrentSplineID,
+			DestinationSplineID: car.DestinationSplineID,
+			DistanceOnSpline:    car.DistanceOnSpline,
+			Speed:               car.Speed,
+			MaxSpeed:            car.MaxSpeed,
+			Accel:               car.Accel,
+			Length:              car.Length,
+			Width:               car.Width,
+		})
+	}
 
 	data, err := json.MarshalIndent(saved, "", "  ")
 	if err != nil {
@@ -1845,29 +1894,68 @@ func saveSplineFile(splines []Spline, path string) error {
 	return os.WriteFile(path, data, 0644)
 }
 
-func loadSplineFile(path string) ([]Spline, int, error) {
+func loadSplineFile(path string) ([]Spline, []Route, []Car, int, int, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, 1, err
+		return nil, nil, nil, 1, 1, err
 	}
 
 	var saved SavedSplineFile
 	if err := json.Unmarshal(data, &saved); err != nil {
-		return nil, 1, err
+		return nil, nil, nil, 1, 1, err
 	}
 
-	loaded := make([]Spline, 0, len(saved.Splines))
-	maxID := 0
+	loadedSplines := make([]Spline, 0, len(saved.Splines))
+	maxSplineID := 0
 	for _, entry := range saved.Splines {
 		spline := newSpline(entry.ID, entry.P0, entry.P1, entry.P2, entry.P3)
 		spline.Priority = entry.Priority
-		loaded = append(loaded, spline)
-		if entry.ID > maxID {
-			maxID = entry.ID
+		loadedSplines = append(loadedSplines, spline)
+		if entry.ID > maxSplineID {
+			maxSplineID = entry.ID
 		}
 	}
 
-	return loaded, maxID + 1, nil
+	loadedRoutes := make([]Route, 0, len(saved.Routes))
+	maxRouteID := 0
+	for _, entry := range saved.Routes {
+		route := Route{
+			ID:             entry.ID,
+			StartSplineID:  entry.StartSplineID,
+			EndSplineID:    entry.EndSplineID,
+			PathIDs:        entry.PathIDs,
+			SpawnPerMinute: entry.SpawnPerMinute,
+			Color:          colorForDestination(entry.EndSplineID),
+		}
+		if entry.ID > maxRouteID {
+			maxRouteID = entry.ID
+		}
+		loadedRoutes = append(loadedRoutes, route)
+	}
+
+	loadedCars := make([]Car, 0, len(saved.Cars))
+	routeColorByID := make(map[int]rl.Color, len(loadedRoutes))
+	for _, r := range loadedRoutes {
+		routeColorByID[r.ID] = r.Color
+	}
+	for _, entry := range saved.Cars {
+		car := Car{
+			RouteID:             entry.RouteID,
+			CurrentSplineID:     entry.CurrentSplineID,
+			DestinationSplineID: entry.DestinationSplineID,
+			DistanceOnSpline:    entry.DistanceOnSpline,
+			Speed:               entry.Speed,
+			MaxSpeed:            entry.MaxSpeed,
+			Accel:               entry.Accel,
+			Length:              entry.Length,
+			Width:               entry.Width,
+			Color:               routeColorByID[entry.RouteID],
+			Braking:             false,
+		}
+		loadedCars = append(loadedCars, car)
+	}
+
+	return loadedSplines, loadedRoutes, loadedCars, maxSplineID + 1, maxRouteID + 1, nil
 }
 
 func isCtrlDown() bool {
