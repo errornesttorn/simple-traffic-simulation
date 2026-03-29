@@ -108,5 +108,97 @@
         "Y": -4.0630913
       }
     }
+  ],
+  "routes": [
+    {
+      "id": 1,
+      "start_spline_id": 4,
+      "end_spline_id": 3,
+      "path_ids": [
+        4,
+        1,
+        3
+      ],
+      "spawn_per_minute": 30
+    },
+    {
+      "id": 2,
+      "start_spline_id": 5,
+      "end_spline_id": 3,
+      "path_ids": [
+        5,
+        1,
+        3
+      ],
+      "spawn_per_minute": 10
+    }
+  ],
+  "cars": [
+    {
+      "route_id": 1,
+      "current_spline_id": 3,
+      "destination_spline_id": 3,
+      "distance_on_spline": 1.9424297,
+      "speed": 8.299863,
+      "max_speed": 20.862234,
+      "accel": 2.6651711,
+      "length": 4.3016357,
+      "width": 1.8014947
+    },
+    {
+      "route_id": 1,
+      "current_spline_id": 1,
+      "destination_spline_id": 3,
+      "distance_on_spline": 32.12153,
+      "speed": 8.281354,
+      "max_speed": 31.414051,
+      "accel": 2.957605,
+      "length": 4.3966813,
+      "width": 1.9522163
+    },
+    {
+      "route_id": 1,
+      "current_spline_id": 1,
+      "destination_spline_id": 3,
+      "distance_on_spline": 16.002106,
+      "speed": 8.262845,
+      "max_speed": 25.77415,
+      "accel": 2.965588,
+      "length": 4.215714,
+      "width": 1.8817457
+    },
+    {
+      "route_id": 2,
+      "current_spline_id": 26,
+      "destination_spline_id": 3,
+      "distance_on_spline": 9.89311,
+      "speed": 6.045204,
+      "max_speed": 15.688026,
+      "accel": 4.223979,
+      "length": 4.380023,
+      "width": 1.8930268
+    },
+    {
+      "route_id": 1,
+      "current_spline_id": 4,
+      "destination_spline_id": 3,
+      "distance_on_spline": 19.978472,
+      "speed": 9.599863,
+      "max_speed": 34.54618,
+      "accel": 2.9585972,
+      "length": 4.6099777,
+      "width": 1.9469254
+    },
+    {
+      "route_id": 2,
+      "current_spline_id": 5,
+      "destination_spline_id": 3,
+      "distance_on_spline": 23.162651,
+      "speed": 7.875307,
+      "max_speed": 35.86069,
+      "accel": 3.1601255,
+      "length": 4.2078657,
+      "width": 1.872798
+    }
   ]
 }

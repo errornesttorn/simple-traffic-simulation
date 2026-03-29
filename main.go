@@ -937,6 +937,57 @@ func findForcedLaneChangePath(splines []Spline, currentSplineID, destSplineID in
 	return 0, 0, false
 }
 
+// laneChangeLandingDist computes the arc-length position on destSpline where a
+// lane change from car's current position would land, applying the same geometry
+// rules as buildLaneChangeBridge. Returns (p3Dist, true) when feasible.
+func laneChangeLandingDist(car Car, srcSpline, destSpline Spline) (float32, bool) {
+	if car.Speed < laneChangeMinSpeed {
+		return 0, false
+	}
+	carPos, carHeading := sampleSplineAtDistance(srcSpline, car.DistanceOnSpline)
+	halfDist := car.Speed * laneChangeHalfSecs
+	p1 := vecAdd(carPos, vecScale(carHeading, halfDist))
+	_, crossDist := nearestSampleWithDist(destSpline, p1)
+	if crossDist == 0 || destSpline.Length-crossDist < halfDist {
+		return 0, false
+	}
+	p3Dist := crossDist + halfDist
+	_, destHeading := sampleSplineAtDistance(destSpline, p3Dist)
+	if carHeading.X*destHeading.X+carHeading.Y*destHeading.Y < laneChangeDirCos {
+		return 0, false
+	}
+	return p3Dist, true
+}
+
+// isLaneChangeLandingSafe returns true if landing at p3Dist on destSplineID
+// would not immediately collide with cars already there.
+// Rear cars are given a speed-adjusted gap (2 s of closure distance).
+func isLaneChangeLandingSafe(p3Dist float32, destSplineID int, switchingCar Car, cars []Car) bool {
+	minGap := switchingCar.Length + 4.0
+	for _, other := range cars {
+		if other.CurrentSplineID != destSplineID {
+			continue
+		}
+		diff := other.DistanceOnSpline - p3Dist
+		if diff >= 0 {
+			if diff < minGap {
+				return false
+			}
+		} else {
+			behind := -diff
+			if behind < minGap {
+				return false
+			}
+			if other.Speed > switchingCar.Speed {
+				if behind < (other.Speed-switchingCar.Speed)*2.0 {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
 // buildLaneChangeBridge attempts to build a Bézier bridge from the car's
 // current position to destSplineID. Modifies *car and appends to lcs on
 // success. Returns the updated lcs slice and whether it succeeded.
@@ -1188,16 +1239,30 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 			continue
 		}
 
-		// If a forced lane switch is pending, attempt it once the car reaches
-		// the deadline (10 m before the spline end). At that point the car has
-		// already decelerated to ~10 km/h, so a one-frame overshoot is ~2 cm
-		// and harmless.
+		// Desired lane switch: attempt as soon as a safe gap exists on the
+		// target spline. At the deadline (10 m before end) force it regardless.
 		if car.DesiredLaneSplineID >= 0 {
 			if car.DistanceOnSpline >= car.DesiredLaneDeadline {
+				// Last resort — ignore gap, just switch.
 				if newLcs, ok := buildLaneChangeBridge(car, car.DesiredLaneSplineID, splines, splineIndexByID, lcs, nextID, true); ok {
 					lcs = newLcs
 					car.DesiredLaneSplineID = -1
 					car.DesiredLaneDeadline = 0
+				}
+			} else {
+				// Desired switch: only commit if the landing zone is clear.
+				srcIdx, srcOk := splineIndexByID[car.CurrentSplineID]
+				destIdx, destOk := splineIndexByID[car.DesiredLaneSplineID]
+				if srcOk && destOk {
+					if p3Dist, feasible := laneChangeLandingDist(*car, splines[srcIdx], splines[destIdx]); feasible {
+						if isLaneChangeLandingSafe(p3Dist, car.DesiredLaneSplineID, *car, cars) {
+							if newLcs, ok := buildLaneChangeBridge(car, car.DesiredLaneSplineID, splines, splineIndexByID, lcs, nextID, false); ok {
+								lcs = newLcs
+								car.DesiredLaneSplineID = -1
+								car.DesiredLaneDeadline = 0
+							}
+						}
+					}
 				}
 			}
 			continue
