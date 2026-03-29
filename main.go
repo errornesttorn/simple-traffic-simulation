@@ -96,7 +96,7 @@ const (
 	predictionHorizonSeconds float32 = 4.0
 	predictionStepSeconds    float32 = 0.15
 	blameAngleThresholdDeg   float32 = 45.0
-	brakeDecelMultiplier     float32 = 5.0
+	brakeDecelMultiplier     float32 = 2.5
 )
 
 const (
@@ -123,9 +123,9 @@ const (
 	laneChangeMinSpeed float32 = 3.0 // minimum m/s to attempt a lane change
 	// Minimum dot product of car heading vs destination lane tangent (cos 45° ≈ 0.71).
 	// Prevents switching onto a lane going the wrong way.
-	laneChangeDirCos     float32 = 0.71
-	laneChangeCooldownS  float32 = 5.0 // seconds between lane-change checks (testing value)
-	laneChangeRetrySecs  float32 = 1.0 // retry delay when conditions not met
+	laneChangeDirCos    float32 = 0.71
+	laneChangeCooldownS float32 = 5.0 // seconds between lane-change checks (testing value)
+	laneChangeRetrySecs float32 = 1.0 // retry delay when conditions not met
 )
 
 type Spline struct {
@@ -314,6 +314,7 @@ func main() {
 	routeStartSplineID := -1
 	coupleModeFirstID := -1
 	debugMode := false
+	randomLaneChanges := true
 	nextSplineID := 1
 	nextRouteID := 1
 
@@ -400,6 +401,10 @@ func main() {
 		if rl.IsKeyPressed(rl.KeyD) {
 			debugMode = !debugMode
 		}
+		if rl.IsKeyPressed(rl.KeyN) {
+			randomLaneChanges = !randomLaneChanges
+		}
+		forceLaneChange := rl.IsKeyPressed(rl.KeyF)
 		if isCtrlDown() && rl.IsKeyPressed(rl.KeyS) {
 			path, err := pickSplineFilePath(true)
 			if err != nil {
@@ -462,7 +467,7 @@ func main() {
 
 		vehicleCounts := buildVehicleCounts(cars)
 		routes = updateRouteVisuals(routes, splines, vehicleCounts)
-		laneChangeSplines, cars = computeLaneChanges(cars, splines, laneChangeSplines, &nextSplineID, dt)
+		laneChangeSplines, cars = computeLaneChanges(cars, splines, laneChangeSplines, &nextSplineID, dt, randomLaneChanges, forceLaneChange)
 		allSplines := mergedSplines(splines, laneChangeSplines)
 		brakingDecisions, debugBlameLinks := computeBrakingDecisions(cars, allSplines, vehicleCounts)
 		followCaps := computeFollowingSpeedCaps(cars, allSplines)
@@ -581,7 +586,7 @@ func main() {
 				drawDraftInfo(stage, draft, mouseWorld, preview, camera)
 			}
 		}
-		drawHud(mode, stage, draft, hoveredSpline, routeStartSplineID, coupleModeFirstID, debugMode, camera.Zoom, len(splines), len(routes), len(cars))
+		drawHud(mode, stage, draft, hoveredSpline, routeStartSplineID, coupleModeFirstID, debugMode, randomLaneChanges, camera.Zoom, len(splines), len(routes), len(cars))
 		if routePanel.Open {
 			drawRoutePanel(routePanel, routes)
 		}
@@ -859,18 +864,28 @@ func gcLaneChangeSplines(lcs []Spline, cars []Car) []Spline {
 // computeLaneChanges ticks each car's lane-change cooldown and, when it fires,
 // attempts to build a temporary bridging spline onto a coupled lane.
 // Every car checks every ~laneChangeCooldownS seconds (staggered at spawn).
-func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int, dt float32) ([]Spline, []Car) {
+// When randomLaneChanges is false the timer-based triggering is suppressed.
+// When forceAll is true every eligible car attempts a lane change this frame
+// regardless of cooldown.
+func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int, dt float32, randomLaneChanges, forceAll bool) ([]Spline, []Car) {
 	splineIndexByID := buildSplineIndexByID(splines)
 
 	for i := range cars {
 		car := &cars[i]
-		car.LaneChangeCooldown -= dt
+		if randomLaneChanges {
+			car.LaneChangeCooldown -= dt
+		}
 
-		if car.LaneChanging || car.LaneChangeCooldown > 0 {
+		if car.LaneChanging {
+			continue
+		}
+		if !forceAll && (!randomLaneChanges || car.LaneChangeCooldown > 0) {
 			continue
 		}
 		if car.Speed < laneChangeMinSpeed {
-			car.LaneChangeCooldown = laneChangeRetrySecs
+			if randomLaneChanges {
+				car.LaneChangeCooldown = laneChangeRetrySecs
+			}
 			continue
 		}
 
@@ -900,7 +915,9 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 			// instead of landing perpendicularly.
 			_, crossDist := nearestSampleWithDist(destSpline, p1)
 
-			if destSpline.Length-crossDist < halfDist {
+			// Reject if the dest spline hasn't started yet (nearest point is at
+			// the very beginning) or has already ended (too far ahead).
+			if crossDist == 0 || destSpline.Length-crossDist < halfDist {
 				continue
 			}
 			p3Dist := crossDist + halfDist
@@ -2035,7 +2052,7 @@ func drawNotice(text string) {
 	rl.DrawText(text, x+14, y+8, 18, rl.White)
 }
 
-func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, routeStartSplineID int, coupleModeFirstID int, debugMode bool, zoom float32, splineCount, routeCount, carCount int) {
+func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, routeStartSplineID int, coupleModeFirstID int, debugMode bool, randomLaneChanges bool, zoom float32, splineCount, routeCount, carCount int) {
 	panel := rl.NewColor(248, 248, 250, 240)
 	outline := rl.NewColor(210, 210, 215, 255)
 	text := rl.NewColor(30, 30, 35, 255)
@@ -2082,11 +2099,16 @@ func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, route
 		debugText = "on"
 	}
 
+	randLCText := "off"
+	if randomLaneChanges {
+		randLCText = "on"
+	}
+
 	rl.DrawText("Traffic spline editor", 24, 24, 22, text)
-	rl.DrawText("E: edit | R: route | P: priority | L: lane couple | C: cut spline | D: debug | Ctrl+S: save | Ctrl+O: open | Tab: cycle", 24, 54, 18, muted)
+	rl.DrawText("E: edit | R: route | P: priority | L: lane couple | C: cut spline | D: debug | N: random LC | F: force LC | Ctrl+S: save | Ctrl+O: open | Tab: cycle", 24, 54, 18, muted)
 	rl.DrawText("Priority splines are purple. Debug draws blame lines and lane-change projection lines.", 24, 78, 18, muted)
 	rl.DrawText(fmt.Sprintf("Mode: %s   Status: %s", modeText, statusText), 24, 108, 18, text)
-	rl.DrawText(fmt.Sprintf("Splines: %d   Routes: %d   Cars: %d   Hovered: %s   Debug: %s   Zoom: %.2fx   Scale: 1 unit = 1 m", splineCount, routeCount, carCount, hoverText, debugText, zoom), 24, 132, 18, text)
+	rl.DrawText(fmt.Sprintf("Splines: %d   Routes: %d   Cars: %d   Hovered: %s   Debug: %s   Random LC: %s   Zoom: %.2fx   Scale: 1 unit = 1 m", splineCount, routeCount, carCount, hoverText, debugText, randLCText, zoom), 24, 132, 18, text)
 }
 
 func stageLabel(stage Stage, draft Draft) string {
