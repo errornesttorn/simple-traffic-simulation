@@ -433,7 +433,7 @@
         25,
         7
       ],
-      "spawn_per_minute": 6
+      "spawn_per_minute": 3
     },
     {
       "id": 4,
@@ -455,7 +455,7 @@
         29,
         7
       ],
-      "spawn_per_minute": 6
+      "spawn_per_minute": 3
     },
     {
       "id": 6,
@@ -510,7 +510,7 @@
         30,
         13
       ],
-      "spawn_per_minute": 6
+      "spawn_per_minute": 3
     },
     {
       "id": 11,
@@ -532,31 +532,42 @@
         27,
         11
       ],
-      "spawn_per_minute": 6
+      "spawn_per_minute": 3
     }
   ],
   "cars": [
     {
-      "route_id": 2,
-      "current_spline_id": 22,
-      "destination_spline_id": 13,
-      "distance_on_spline": 13.6370325,
-      "speed": 12.821908,
-      "max_speed": 15.737369,
-      "accel": 4.2089267,
-      "length": 4.039522,
-      "width": 1.8438665
+      "route_id": 1,
+      "current_spline_id": 24,
+      "destination_spline_id": 11,
+      "distance_on_spline": 11.485981,
+      "speed": 11.322971,
+      "max_speed": 15.081892,
+      "accel": 3.83376,
+      "length": 4.615521,
+      "width": 1.8682986
     },
     {
-      "route_id": 3,
+      "route_id": 1,
       "current_spline_id": 23,
-      "destination_spline_id": 7,
-      "distance_on_spline": 1.1616666,
-      "speed": 2.9500434,
-      "max_speed": 33.48935,
-      "accel": 3.4050684,
-      "length": 4.702015,
-      "width": 1.800183
+      "destination_spline_id": 11,
+      "distance_on_spline": 1.9144468,
+      "speed": 3.9225402,
+      "max_speed": 29.186234,
+      "accel": 3.7157261,
+      "length": 4.043624,
+      "width": 1.8379747
+    },
+    {
+      "route_id": 10,
+      "current_spline_id": 19,
+      "destination_spline_id": 13,
+      "distance_on_spline": 0.9538945,
+      "speed": 2.6887357,
+      "max_speed": 27.151922,
+      "accel": 3.8011582,
+      "length": 4.500877,
+      "width": 1.8609138
     }
   ]
 }
