@@ -24,7 +24,8 @@
       ],
       "soft_coupled_ids": [
         11
-      ]
+      ],
+      "speed_limit_kmh": 50
     },
     {
       "id": 9,
@@ -50,7 +51,8 @@
       ],
       "soft_coupled_ids": [
         10
-      ]
+      ],
+      "speed_limit_kmh": 50
     },
     {
       "id": 10,
@@ -78,7 +80,8 @@
       "soft_coupled_ids": [
         9,
         13
-      ]
+      ],
+      "speed_limit_kmh": 50
     },
     {
       "id": 11,
@@ -100,13 +103,14 @@
         "Y": -0.4284668
       },
       "hard_coupled_ids": [
-        13,
-        9
+        9,
+        13
       ],
       "soft_coupled_ids": [
         8,
         12
-      ]
+      ],
+      "speed_limit_kmh": 50
     },
     {
       "id": 12,
@@ -132,7 +136,8 @@
       ],
       "soft_coupled_ids": [
         11
-      ]
+      ],
+      "speed_limit_kmh": 50
     },
     {
       "id": 13,
@@ -158,7 +163,8 @@
       ],
       "soft_coupled_ids": [
         10
-      ]
+      ],
+      "speed_limit_kmh": 50
     },
     {
       "id": 15,
@@ -256,26 +262,15 @@
   ],
   "cars": [
     {
-      "route_id": 2,
-      "current_spline_id": 11,
-      "destination_spline_id": 16,
-      "distance_on_spline": 27.356445,
-      "speed": 15.925828,
-      "max_speed": 16.010326,
-      "accel": 3.7369494,
-      "length": 4.5510073,
-      "width": 1.9355782
-    },
-    {
-      "route_id": 2,
+      "route_id": 3,
       "current_spline_id": 15,
-      "destination_spline_id": 16,
-      "distance_on_spline": 19.211353,
-      "speed": 12.118512,
-      "max_speed": 34.957764,
-      "accel": 3.7797744,
-      "length": 4.7865334,
-      "width": 1.8101765
+      "destination_spline_id": 17,
+      "distance_on_spline": 17.067604,
+      "speed": 11.912808,
+      "max_speed": 35.34731,
+      "accel": 4.094555,
+      "length": 4.455156,
+      "width": 1.8127112
     }
   ]
 }

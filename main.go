@@ -228,6 +228,11 @@ type Car struct {
 	AfterSplineID      int     // destination spline to continue on after the bridge
 	AfterSplineDist    float32 // arc-length on AfterSplineID where the bridge lands
 	LaneChangeCooldown float32 // seconds until the next lane-change eligibility check
+
+	// Forced lane-switch state (set when no direct path exists but a hard-coupled
+	// neighbour of the next physical spline does have a path).
+	DesiredLaneSplineID int     // spline to merge into; -1 = none
+	DesiredLaneDeadline float32 // arc-length on current spline beyond which the switch must start
 }
 
 type TrajectorySample struct {
@@ -888,11 +893,10 @@ func effectiveMaxSpeedMPS(spline Spline) float32 {
 	return cap * spline.SpeedFactor
 }
 
-// laneChangeFeasible checks whether a lane change from the very start of src to
-// dst is geometrically possible at the given speed, using the same rules as the
-// runtime lane-change system.
-func laneChangeFeasible(src, dst Spline, speed float32) bool {
-	carPos, carHeading := sampleSplineAtDistance(src, 0)
+// laneChangeFeasibleAt checks whether a lane change from a specific arc-length
+// distance on src to dst is geometrically possible at the given speed.
+func laneChangeFeasibleAt(src, dst Spline, distance, speed float32) bool {
+	carPos, carHeading := sampleSplineAtDistance(src, distance)
 	halfDist := speed * laneChangeHalfSecs
 	p1 := vecAdd(carPos, vecScale(carHeading, halfDist))
 	_, crossDist := nearestSampleWithDist(dst, p1)
@@ -901,6 +905,109 @@ func laneChangeFeasible(src, dst Spline, speed float32) bool {
 	}
 	_, destHeading := sampleSplineAtDistance(dst, crossDist+halfDist)
 	return carHeading.X*destHeading.X+carHeading.Y*destHeading.Y >= laneChangeDirCos
+}
+
+// laneChangeFeasible checks whether a lane change from the very start of src to
+// dst is geometrically possible at the given speed, using the same rules as the
+// runtime lane-change system.
+func laneChangeFeasible(src, dst Spline, speed float32) bool {
+	return laneChangeFeasibleAt(src, dst, 0, speed)
+}
+
+// computeLaneChangeDeadline returns the last arc-length position on src from
+// which a lane change to dst is still geometrically possible at max speed.
+// The result is computed once via binary search and stored on the car.
+func computeLaneChangeDeadline(src, dst Spline) float32 {
+	speed := effectiveMaxSpeedMPS(src)
+	// If not feasible from the start there is no valid range at all.
+	if !laneChangeFeasibleAt(src, dst, 0, speed) {
+		return 0
+	}
+	// If feasible even at the very end there is no binding deadline.
+	if laneChangeFeasibleAt(src, dst, src.Length, speed) {
+		return src.Length
+	}
+	// Binary search for the last feasible position.
+	lo, hi := float32(0), src.Length
+	for i := 0; i < 20; i++ {
+		mid := (lo + hi) / 2
+		if laneChangeFeasibleAt(src, dst, mid, speed) {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+// findForcedLaneChangePath looks for a physically reachable next spline whose
+// hard-coupled partners include one that has a valid path to the destination.
+// Returns the ID of the next spline to enter and the ID of the desired target
+// spline to switch to once on that next spline.
+func findForcedLaneChangePath(splines []Spline, currentSplineID, destSplineID int, vehicleCounts map[int]int) (nextSplineID, desiredSplineID int, ok bool) {
+	currentSpline, found := findSplineByID(splines, currentSplineID)
+	if !found {
+		return 0, 0, false
+	}
+	startsByNode := buildStartsByNode(splines)
+	for _, nextIdx := range startsByNode[pointKey(currentSpline.P3)] {
+		nextSpline := splines[nextIdx]
+		for _, coupledID := range nextSpline.HardCoupledIDs {
+			if _, _, pathOk := findShortestPathWeighted(splines, coupledID, destSplineID, vehicleCounts); pathOk {
+				return nextSpline.ID, coupledID, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// buildLaneChangeBridge attempts to build a Bézier bridge from the car's
+// current position to destSplineID. Modifies *car and appends to lcs on
+// success. Returns the updated lcs slice and whether it succeeded.
+func buildLaneChangeBridge(car *Car, destSplineID int, splines []Spline, splineIndexByID map[int]int, lcs []Spline, nextID *int) ([]Spline, bool) {
+	srcIdx, ok := splineIndexByID[car.CurrentSplineID]
+	if !ok {
+		return lcs, false
+	}
+	destIdx, ok := splineIndexByID[destSplineID]
+	if !ok {
+		return lcs, false
+	}
+	if car.Speed < laneChangeMinSpeed {
+		return lcs, false
+	}
+
+	srcSpline := splines[srcIdx]
+	destSpline := splines[destIdx]
+	carPos, carHeading := sampleSplineAtDistance(srcSpline, car.DistanceOnSpline)
+	halfDist := car.Speed * laneChangeHalfSecs
+
+	p1 := vecAdd(carPos, vecScale(carHeading, halfDist))
+	_, crossDist := nearestSampleWithDist(destSpline, p1)
+	if crossDist == 0 || destSpline.Length-crossDist < halfDist {
+		return lcs, false
+	}
+	p3Dist := crossDist + halfDist
+	p3, destHeading := sampleSplineAtDistance(destSpline, p3Dist)
+	if carHeading.X*destHeading.X+carHeading.Y*destHeading.Y < laneChangeDirCos {
+		return lcs, false
+	}
+
+	p2 := vecSub(p3, vecScale(destHeading, halfDist))
+	id := *nextID
+	*nextID++
+	lcs = append(lcs, newSpline(id, carPos, p1, p2, p3))
+
+	car.PrevSplineIDs[1] = car.PrevSplineIDs[0]
+	car.PrevSplineIDs[0] = car.CurrentSplineID
+	car.CurrentSplineID = id
+	car.DistanceOnSpline = 0
+	car.LaneChanging = true
+	car.LaneChangeSplineID = id
+	car.AfterSplineID = destSplineID
+	car.AfterSplineDist = p3Dist
+	car.LaneChangeCooldown = laneChangeCooldownS
+	return lcs, true
 }
 
 func handleCoupleMode(firstID int, splines []Spline, hoveredSpline int) (int, []Spline, string) {
@@ -1098,6 +1205,19 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 		if car.LaneChanging {
 			continue
 		}
+
+		// If a forced lane switch is pending, handle only that — skip random changes.
+		if car.DesiredLaneSplineID >= 0 {
+			if car.DistanceOnSpline >= car.DesiredLaneDeadline {
+				if newLcs, ok := buildLaneChangeBridge(car, car.DesiredLaneSplineID, splines, splineIndexByID, lcs, nextID); ok {
+					lcs = newLcs
+					car.DesiredLaneSplineID = -1
+					car.DesiredLaneDeadline = 0
+				}
+			}
+			continue
+		}
+
 		if !forceAll && (!randomLaneChanges || car.LaneChangeCooldown > 0) {
 			continue
 		}
@@ -1119,63 +1239,15 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 			car.LaneChangeCooldown = laneChangeCooldownS
 			continue
 		}
-		carPos, carHeading := sampleSplineAtDistance(currentSpline, car.DistanceOnSpline)
-		halfDist := car.Speed * laneChangeHalfSecs
 
 		switched := false
 		for _, destID := range allCoupled {
-			destIdx, ok := splineIndexByID[destID]
-			if !ok {
-				continue
+			if newLcs, ok := buildLaneChangeBridge(car, destID, splines, splineIndexByID, lcs, nextID); ok {
+				lcs = newLcs
+				switched = true
+				break
 			}
-			destSpline := splines[destIdx]
-
-			// P1: one handle-length ahead along the current tangent.
-			p1 := vecAdd(carPos, vecScale(carHeading, halfDist))
-
-			// Find the crossing anchor: nearest point on the dest spline to P1.
-			// P3 is then placed halfDist *further* along the dest spline from
-			// that anchor, so the bridge arrives already aligned with traffic
-			// instead of landing perpendicularly.
-			_, crossDist := nearestSampleWithDist(destSpline, p1)
-
-			// Reject if the dest spline hasn't started yet (nearest point is at
-			// the very beginning) or has already ended (too far ahead).
-			if crossDist == 0 || destSpline.Length-crossDist < halfDist {
-				continue
-			}
-			p3Dist := crossDist + halfDist
-			p3, destHeading := sampleSplineAtDistance(destSpline, p3Dist)
-
-			// Heading check: destination must be going roughly the same direction.
-			if carHeading.X*destHeading.X+carHeading.Y*destHeading.Y < laneChangeDirCos {
-				continue
-			}
-
-			// P2: one handle-length back along the destination tangent from P3.
-			p2 := vecSub(p3, vecScale(destHeading, halfDist))
-
-			// Build and register the temporary bridging spline.
-			id := *nextID
-			*nextID++
-			bridgeSpline := newSpline(id, carPos, p1, p2, p3)
-			lcs = append(lcs, bridgeSpline)
-
-			// Commit the lane change on the car.
-			car.PrevSplineIDs[1] = car.PrevSplineIDs[0]
-			car.PrevSplineIDs[0] = car.CurrentSplineID
-			car.CurrentSplineID = id
-			car.DistanceOnSpline = 0
-			car.LaneChanging = true
-			car.LaneChangeSplineID = id
-			car.AfterSplineID = destID
-			car.AfterSplineDist = p3Dist
-			car.LaneChangeCooldown = laneChangeCooldownS
-
-			switched = true
-			break
 		}
-
 		if !switched {
 			car.LaneChangeCooldown = laneChangeCooldownS
 		}
@@ -1607,6 +1679,7 @@ func spawnCar(route Route) Car {
 		LaneChangeSplineID:  -1,
 		AfterSplineID:       -1,
 		LaneChangeCooldown:  rand.Float32() * laneChangeCooldownS,
+		DesiredLaneSplineID: -1,
 	}
 }
 
@@ -1822,8 +1895,12 @@ func predictCarTrajectory(car Car, splines []Spline, vehicleCounts map[int]int, 
 
 			nextSplineID, ok := chooseNextSplineOnBestPath(splines, simCar.CurrentSplineID, simCar.DestinationSplineID, vehicleCounts)
 			if !ok {
-				active = false
-				break
+				forcedNext, _, forcedOk := findForcedLaneChangePath(splines, simCar.CurrentSplineID, simCar.DestinationSplineID, vehicleCounts)
+				if !forcedOk {
+					active = false
+					break
+				}
+				nextSplineID = forcedNext
 			}
 			simCar.CurrentSplineID = nextSplineID
 		}
@@ -2119,12 +2196,37 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 				car.DistanceOnSpline = car.AfterSplineDist + overshoot
 				car.LaneChanging = false
 				car.LaneChangeSplineID = -1
+				// If the car arrived on its desired lane, clear the forced-switch state.
+				if car.CurrentSplineID == car.DesiredLaneSplineID {
+					car.DesiredLaneSplineID = -1
+					car.DesiredLaneDeadline = 0
+				}
 				continue
 			}
 
 			nextSplineID, ok := chooseNextSplineOnBestPath(splines, car.CurrentSplineID, car.DestinationSplineID, vehicleCounts)
-			if !ok {
-				break
+			if ok {
+				// Normal path found — any pending forced-switch is no longer needed.
+				if car.DesiredLaneSplineID >= 0 {
+					car.DesiredLaneSplineID = -1
+					car.DesiredLaneDeadline = 0
+				}
+			} else {
+				// No direct path: check whether entering a physical next spline whose
+				// hard-coupled partner has a path can rescue the car.
+				forcedNext, desiredLane, forcedOk := findForcedLaneChangePath(splines, car.CurrentSplineID, car.DestinationSplineID, vehicleCounts)
+				if !forcedOk {
+					break
+				}
+				nextSplineID = forcedNext
+				car.DesiredLaneSplineID = desiredLane
+				// Pre-compute and cache the last position on the forced spline where
+				// the switch is still geometrically possible.
+				if src, srcOk := findSplineByID(splines, forcedNext); srcOk {
+					if dst, dstOk := findSplineByID(splines, desiredLane); dstOk {
+						car.DesiredLaneDeadline = computeLaneChangeDeadline(src, dst)
+					}
+				}
 			}
 			car.PrevSplineIDs[1] = car.PrevSplineIDs[0]
 			car.PrevSplineIDs[0] = car.CurrentSplineID
@@ -3172,6 +3274,7 @@ func loadSplineFile(path string) ([]Spline, []Route, []Car, int, int, error) {
 			LaneChangeSplineID:  -1,
 			AfterSplineID:       -1,
 			LaneChangeCooldown:  rand.Float32() * laneChangeCooldownS,
+			DesiredLaneSplineID: -1,
 		}
 		loadedCars = append(loadedCars, car)
 	}
