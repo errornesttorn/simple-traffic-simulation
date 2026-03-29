@@ -56,6 +56,7 @@ const (
 	ModePriority
 	ModeCouple
 	ModeCut
+	ModeSpeedLimit
 )
 
 const (
@@ -124,8 +125,9 @@ const (
 	// Minimum dot product of car heading vs destination lane tangent (cos 45° ≈ 0.71).
 	// Prevents switching onto a lane going the wrong way.
 	laneChangeDirCos    float32 = 0.71
-	laneChangeCooldownS float32 = 5.0 // seconds between lane-change checks (testing value)
-	laneChangeRetrySecs float32 = 1.0 // retry delay when conditions not met
+	laneChangeCooldownS float32 = 5.0  // seconds between lane-change checks (testing value)
+	laneChangeRetrySecs float32 = 1.0  // retry delay when conditions not met
+	maxCarSpeed         float32 = 36.1 // m/s — upper bound of car MaxSpeed range (130 km/h)
 )
 
 type Spline struct {
@@ -141,7 +143,9 @@ type Spline struct {
 	SpeedFactor      float32
 	Samples          [simSamples + 1]rl.Vector2
 	CumLen           [simSamples + 1]float32
-	CoupledSplineIDs []int // parallel/adjacent lanes coupled to this one
+	HardCoupledIDs []int // parallel lanes that also act as pathfinding neighbours
+	SoftCoupledIDs []int // parallel lanes used for lane-changes only, not routing
+	SpeedLimitKmh  float32 // 0 = no limit
 }
 
 type Draft struct {
@@ -263,7 +267,9 @@ type SavedSpline struct {
 	P1         rl.Vector2 `json:"p1"`
 	P2         rl.Vector2 `json:"p2"`
 	P3         rl.Vector2 `json:"p3"`
-	CoupledIDs []int      `json:"coupled_ids,omitempty"`
+	HardCoupledIDs []int   `json:"hard_coupled_ids,omitempty"`
+	SoftCoupledIDs []int   `json:"soft_coupled_ids,omitempty"`
+	SpeedLimitKmh  float32 `json:"speed_limit_kmh,omitempty"`
 }
 
 type SavedRoute struct {
@@ -315,6 +321,7 @@ func main() {
 	coupleModeFirstID := -1
 	debugMode := false
 	randomLaneChanges := true
+	selectedSpeedKmh := 50
 	nextSplineID := 1
 	nextRouteID := 1
 
@@ -343,6 +350,8 @@ func main() {
 				mode = ModeCouple
 			case ModeCouple:
 				mode = ModeCut
+			case ModeCut:
+				mode = ModeSpeedLimit
 			default:
 				mode = ModeEdit
 			}
@@ -391,6 +400,15 @@ func main() {
 		}
 		if rl.IsKeyPressed(rl.KeyC) {
 			mode = ModeCut
+			stage = StageIdle
+			draft = newDraft()
+			cutDraft = newCutDraft()
+			routePanel = RoutePanel{}
+			routeStartSplineID = -1
+			coupleModeFirstID = -1
+		}
+		if rl.IsKeyPressed(rl.KeyS) && !isCtrlDown() {
+			mode = ModeSpeedLimit
 			stage = StageIdle
 			draft = newDraft()
 			cutDraft = newCutDraft()
@@ -503,7 +521,12 @@ func main() {
 			case ModePriority:
 				splines = handlePriorityMode(splines, hoveredSpline)
 			case ModeCouple:
-				coupleModeFirstID, splines = handleCoupleMode(coupleModeFirstID, splines, hoveredSpline)
+				var coupleNotice string
+				coupleModeFirstID, splines, coupleNotice = handleCoupleMode(coupleModeFirstID, splines, hoveredSpline)
+				if coupleNotice != "" {
+					noticeText = coupleNotice
+					noticeTimer = 3.0
+				}
 			case ModeCut:
 				var topologyChanged bool
 				stage, cutDraft, splines, nextSplineID, topologyChanged = handleCutMode(stage, cutDraft, splines, mouseWorld, nextSplineID)
@@ -512,6 +535,9 @@ func main() {
 					cars = cars[:0]
 					laneChangeSplines = laneChangeSplines[:0]
 				}
+			case ModeSpeedLimit:
+				splines = handleSpeedLimitMode(splines, hoveredSpline, selectedSpeedKmh)
+				selectedSpeedKmh = updateSpeedLimitPanel(selectedSpeedKmh)
 			}
 		}
 
@@ -569,6 +595,9 @@ func main() {
 		if mode == ModeCouple {
 			drawCoupleMode(splines, coupleModeFirstID, hoveredSpline, camera.Zoom)
 		}
+		if mode == ModeSpeedLimit {
+			drawSpeedLimitWorld(splines, hoveredSpline, camera.Zoom)
+		}
 		if mode == ModeCut {
 			drawCutMode(stage, cutDraft, splines, mouseWorld, camera.Zoom)
 		}
@@ -586,7 +615,11 @@ func main() {
 				drawDraftInfo(stage, draft, mouseWorld, preview, camera)
 			}
 		}
+		drawSpeedLimitLabels(splines, camera)
 		drawHud(mode, stage, draft, hoveredSpline, routeStartSplineID, coupleModeFirstID, debugMode, randomLaneChanges, camera.Zoom, len(splines), len(routes), len(cars))
+		if mode == ModeSpeedLimit {
+			drawSpeedLimitPanel(selectedSpeedKmh)
+		}
 		if routePanel.Open {
 			drawRoutePanel(routePanel, routes)
 		}
@@ -724,41 +757,223 @@ func handlePriorityMode(splines []Spline, hoveredSpline int) []Spline {
 	return splines
 }
 
-func handleCoupleMode(firstID int, splines []Spline, hoveredSpline int) (int, []Spline) {
-	if rl.IsKeyPressed(rl.KeyEscape) || rl.IsMouseButtonPressed(rl.MouseButtonRight) {
-		return -1, splines
+func handleSpeedLimitMode(splines []Spline, hoveredSpline, selectedSpeedKmh int) []Spline {
+	if hoveredSpline < 0 {
+		return splines
 	}
-	if !rl.IsMouseButtonPressed(rl.MouseButtonLeft) || hoveredSpline < 0 {
-		return firstID, splines
+	mousePos := rl.GetMousePosition()
+	if isMouseOverSpeedLimitPanel(mousePos) {
+		return splines
+	}
+	if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		splines[hoveredSpline].SpeedLimitKmh = float32(selectedSpeedKmh)
+	}
+	if rl.IsMouseButtonPressed(rl.MouseButtonRight) {
+		splines[hoveredSpline].SpeedLimitKmh = 0
+	}
+	return splines
+}
+
+// updateSpeedLimitPanel handles clicks on the speed picker panel and returns
+// the newly selected speed in km/h.
+func updateSpeedLimitPanel(selectedSpeedKmh int) int {
+	if !rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		return selectedSpeedKmh
+	}
+	mouse := rl.GetMousePosition()
+	px, _ := speedLimitPanelOrigin()
+	for i, kmh := range speedLimitSteps() {
+		col := i / 7
+		row := i % 7
+		bx := px + float32(col)*84
+		by := float32(180 + row*32)
+		if mouse.X >= bx && mouse.X <= bx+76 && mouse.Y >= by && mouse.Y <= by+24 {
+			return kmh
+		}
+	}
+	return selectedSpeedKmh
+}
+
+func isMouseOverSpeedLimitPanel(mouse rl.Vector2) bool {
+	px, _ := speedLimitPanelOrigin()
+	panelW := float32(172)
+	panelH := float32(7*32 + 32)
+	return mouse.X >= px-8 && mouse.X <= px-8+panelW && mouse.Y >= float32(172) && mouse.Y <= float32(172)+panelH
+}
+
+func speedLimitPanelOrigin() (float32, float32) {
+	return float32(rl.GetScreenWidth()) - 188, 180
+}
+
+func speedLimitSteps() []int {
+	steps := make([]int, 0, 14)
+	for kmh := 10; kmh <= 140; kmh += 10 {
+		steps = append(steps, kmh)
+	}
+	return steps
+}
+
+// drawSpeedLimitWorld highlights the hovered spline in speed-limit mode.
+func drawSpeedLimitWorld(splines []Spline, hoveredSpline int, zoom float32) {
+	if hoveredSpline < 0 {
+		return
+	}
+	drawSpline(splines[hoveredSpline], pixelsToWorld(zoom, 4), rl.NewColor(255, 200, 50, 180))
+}
+
+// drawSpeedLimitLabels draws speed limit badges on any spline that has a limit,
+// in screen space, so they stay readable at any zoom level.
+func drawSpeedLimitLabels(splines []Spline, camera rl.Camera2D) {
+	for _, spline := range splines {
+		if spline.SpeedLimitKmh <= 0 {
+			continue
+		}
+		mid := spline.Samples[simSamples/2]
+		screen := rl.GetWorldToScreen2D(mid, camera)
+		label := fmt.Sprintf("%d", int(spline.SpeedLimitKmh))
+		fontSize := int32(14)
+		textW := rl.MeasureText(label, fontSize)
+		r := int32(14)
+		cx, cy := int32(screen.X), int32(screen.Y)
+		rl.DrawCircle(cx, cy, float32(r), rl.White)
+		rl.DrawCircleLines(cx, cy, float32(r), rl.NewColor(200, 30, 30, 255))
+		rl.DrawText(label, cx-textW/2, cy-fontSize/2, fontSize, rl.NewColor(200, 30, 30, 255))
+	}
+}
+
+// drawSpeedLimitPanel draws the speed picker UI in screen space.
+func drawSpeedLimitPanel(selectedSpeedKmh int) {
+	bg := rl.NewColor(248, 248, 250, 245)
+	outline := rl.NewColor(210, 210, 215, 255)
+	text := rl.NewColor(30, 30, 35, 255)
+	selBg := rl.NewColor(200, 30, 30, 220)
+	selText := rl.White
+
+	px, _ := speedLimitPanelOrigin()
+	panelX := int32(px - 8)
+	panelW := int32(172)
+	panelH := int32(7*32 + 32)
+	rl.DrawRectangle(panelX, 172, panelW, panelH, bg)
+	rl.DrawRectangleLines(panelX, 172, panelW, panelH, outline)
+	rl.DrawText("Speed limit", panelX+8, 178, 16, text)
+
+	for i, kmh := range speedLimitSteps() {
+		col := i / 7
+		row := i % 7
+		bx := int32(px) + int32(col)*84
+		by := int32(180 + row*32)
+		label := fmt.Sprintf("%d km/h", kmh)
+		if kmh == selectedSpeedKmh {
+			rl.DrawRectangle(bx, by, 76, 24, selBg)
+			rl.DrawRectangleLines(bx, by, 76, 24, rl.NewColor(150, 20, 20, 255))
+			rl.DrawText(label, bx+6, by+5, 14, selText)
+		} else {
+			rl.DrawRectangle(bx, by, 76, 24, rl.NewColor(235, 236, 240, 255))
+			rl.DrawRectangleLines(bx, by, 76, 24, outline)
+			rl.DrawText(label, bx+6, by+5, 14, text)
+		}
+	}
+}
+
+// effectiveMaxSpeedMPS returns the fastest a car can ever travel on a spline,
+// taking the global max car speed, the spline's speed factor, and any speed
+// limit into account.
+func effectiveMaxSpeedMPS(spline Spline) float32 {
+	cap := maxCarSpeed
+	if spline.SpeedLimitKmh > 0 {
+		if limitMPS := spline.SpeedLimitKmh / 3.6; limitMPS < cap {
+			cap = limitMPS
+		}
+	}
+	return cap * spline.SpeedFactor
+}
+
+// laneChangeFeasible checks whether a lane change from the very start of src to
+// dst is geometrically possible at the given speed, using the same rules as the
+// runtime lane-change system.
+func laneChangeFeasible(src, dst Spline, speed float32) bool {
+	carPos, carHeading := sampleSplineAtDistance(src, 0)
+	halfDist := speed * laneChangeHalfSecs
+	p1 := vecAdd(carPos, vecScale(carHeading, halfDist))
+	_, crossDist := nearestSampleWithDist(dst, p1)
+	if crossDist == 0 || dst.Length-crossDist < halfDist {
+		return false
+	}
+	_, destHeading := sampleSplineAtDistance(dst, crossDist+halfDist)
+	return carHeading.X*destHeading.X+carHeading.Y*destHeading.Y >= laneChangeDirCos
+}
+
+func handleCoupleMode(firstID int, splines []Spline, hoveredSpline int) (int, []Spline, string) {
+	if rl.IsKeyPressed(rl.KeyEscape) {
+		return -1, splines, ""
+	}
+
+	leftClicked := rl.IsMouseButtonPressed(rl.MouseButtonLeft) && hoveredSpline >= 0
+	rightClicked := rl.IsMouseButtonPressed(rl.MouseButtonRight) && hoveredSpline >= 0
+
+	if !leftClicked && !rightClicked {
+		return firstID, splines, ""
 	}
 
 	clickedID := splines[hoveredSpline].ID
 
 	if firstID < 0 {
-		// Select first spline.
-		return clickedID, splines
+		if leftClicked {
+			return clickedID, splines, ""
+		}
+		return firstID, splines, ""
 	}
 	if clickedID == firstID {
-		// Clicked the same spline — deselect.
-		return -1, splines
+		return -1, splines, ""
 	}
 
-	// Toggle coupling between firstID and clickedID.
-	splines = toggleCoupling(splines, firstID, clickedID)
-	return -1, splines
+	if leftClicked {
+		idxA := findSplineIndexByID(splines, firstID)
+		idxB := findSplineIndexByID(splines, clickedID)
+		if idxA >= 0 && idxB >= 0 {
+			splineA := splines[idxA]
+			splineB := splines[idxB]
+			speedA := effectiveMaxSpeedMPS(splineA)
+			speedB := effectiveMaxSpeedMPS(splineB)
+			if !laneChangeFeasible(splineA, splineB, speedA) || !laneChangeFeasible(splineB, splineA, speedB) {
+				return -1, splines, "Hard couple rejected: lane change not feasible at max speed from the start of both splines"
+			}
+		}
+		splines = toggleHardCoupling(splines, firstID, clickedID)
+	} else {
+		splines = toggleSoftCoupling(splines, firstID, clickedID)
+	}
+	return -1, splines, ""
 }
 
-// toggleCoupling adds or removes a bidirectional coupling between two splines.
-func toggleCoupling(splines []Spline, idA, idB int) []Spline {
+func toggleHardCoupling(splines []Spline, idA, idB int) []Spline {
+	return toggleCouplingList(splines, idA, idB, true)
+}
+
+func toggleSoftCoupling(splines []Spline, idA, idB int) []Spline {
+	return toggleCouplingList(splines, idA, idB, false)
+}
+
+// toggleCouplingList adds or removes a bidirectional hard or soft coupling.
+// Toggling one type also removes the other, so a pair can only have one coupling type at a time.
+func toggleCouplingList(splines []Spline, idA, idB int, hard bool) []Spline {
 	idxA := findSplineIndexByID(splines, idA)
 	idxB := findSplineIndexByID(splines, idB)
 	if idxA < 0 || idxB < 0 {
 		return splines
 	}
 
-	// Check if already coupled.
+	var primaryA, otherA, primaryB, otherB *[]int
+	if hard {
+		primaryA, otherA = &splines[idxA].HardCoupledIDs, &splines[idxA].SoftCoupledIDs
+		primaryB, otherB = &splines[idxB].HardCoupledIDs, &splines[idxB].SoftCoupledIDs
+	} else {
+		primaryA, otherA = &splines[idxA].SoftCoupledIDs, &splines[idxA].HardCoupledIDs
+		primaryB, otherB = &splines[idxB].SoftCoupledIDs, &splines[idxB].HardCoupledIDs
+	}
+
 	alreadyCoupled := false
-	for _, id := range splines[idxA].CoupledSplineIDs {
+	for _, id := range *primaryA {
 		if id == idB {
 			alreadyCoupled = true
 			break
@@ -766,19 +981,23 @@ func toggleCoupling(splines []Spline, idA, idB int) []Spline {
 	}
 
 	if alreadyCoupled {
-		splines[idxA].CoupledSplineIDs = removeInt(splines[idxA].CoupledSplineIDs, idB)
-		splines[idxB].CoupledSplineIDs = removeInt(splines[idxB].CoupledSplineIDs, idA)
+		*primaryA = removeInt(*primaryA, idB)
+		*primaryB = removeInt(*primaryB, idA)
 	} else {
-		splines[idxA].CoupledSplineIDs = append(splines[idxA].CoupledSplineIDs, idB)
-		splines[idxB].CoupledSplineIDs = append(splines[idxB].CoupledSplineIDs, idA)
+		// Remove from the opposite list first (can't be both hard and soft).
+		*otherA = removeInt(*otherA, idB)
+		*otherB = removeInt(*otherB, idA)
+		*primaryA = append(*primaryA, idB)
+		*primaryB = append(*primaryB, idA)
 	}
 	return splines
 }
 
-// removeSplineFromCouplings removes all references to deletedID from every spline's coupled list.
+// removeSplineFromCouplings removes all references to deletedID from every spline's coupling lists.
 func removeSplineFromCouplings(splines []Spline, deletedID int) []Spline {
 	for i := range splines {
-		splines[i].CoupledSplineIDs = removeInt(splines[i].CoupledSplineIDs, deletedID)
+		splines[i].HardCoupledIDs = removeInt(splines[i].HardCoupledIDs, deletedID)
+		splines[i].SoftCoupledIDs = removeInt(splines[i].SoftCoupledIDs, deletedID)
 	}
 	return splines
 }
@@ -890,16 +1109,21 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 		}
 
 		splineIdx, ok := splineIndexByID[car.CurrentSplineID]
-		if !ok || len(splines[splineIdx].CoupledSplineIDs) == 0 {
+		if !ok {
 			car.LaneChangeCooldown = laneChangeCooldownS
 			continue
 		}
 		currentSpline := splines[splineIdx]
+		allCoupled := append(append([]int(nil), currentSpline.HardCoupledIDs...), currentSpline.SoftCoupledIDs...)
+		if len(allCoupled) == 0 {
+			car.LaneChangeCooldown = laneChangeCooldownS
+			continue
+		}
 		carPos, carHeading := sampleSplineAtDistance(currentSpline, car.DistanceOnSpline)
 		halfDist := car.Speed * laneChangeHalfSecs
 
 		switched := false
-		for _, destID := range currentSpline.CoupledSplineIDs {
+		for _, destID := range allCoupled {
 			destIdx, ok := splineIndexByID[destID]
 			if !ok {
 				continue
@@ -985,15 +1209,16 @@ func drawLaneChangeSplines(lcs []Spline, zoom float32) {
 // drawCoupleMode draws coupling relationship lines between coupled splines
 // and highlights the currently selected first spline.
 func drawCoupleMode(splines []Spline, firstSelectedID int, hoveredSpline int, zoom float32) {
-	lineColor := rl.NewColor(80, 180, 255, 180)
+	hardColor := rl.NewColor(80, 180, 255, 180)   // blue — hard coupling
+	softColor := rl.NewColor(180, 120, 255, 180)   // purple — soft coupling
 	selectedColor := rl.NewColor(255, 200, 50, 255)
 	hoveredColor := rl.NewColor(255, 140, 30, 200)
 	thickness := pixelsToWorld(zoom, 2)
+	r := pixelsToWorld(zoom, 5)
 
-	// Draw all coupling links (draw once per unique pair by only drawing when idA < idB).
-	for _, spline := range splines {
+	drawLinks := func(ids []int, spline Spline, color rl.Color) {
 		midA := spline.Samples[simSamples/2]
-		for _, coupledID := range spline.CoupledSplineIDs {
+		for _, coupledID := range ids {
 			if coupledID <= spline.ID {
 				continue // draw each pair once
 			}
@@ -1002,12 +1227,16 @@ func drawCoupleMode(splines []Spline, firstSelectedID int, hoveredSpline int, zo
 				continue
 			}
 			midB := splines[idx].Samples[simSamples/2]
-			rl.DrawLineEx(midA, midB, thickness, lineColor)
-			// Draw small circles at both midpoints to make the link obvious.
-			r := pixelsToWorld(zoom, 5)
-			rl.DrawCircleV(midA, r, lineColor)
-			rl.DrawCircleV(midB, r, lineColor)
+			rl.DrawLineEx(midA, midB, thickness, color)
+			rl.DrawCircleV(midA, r, color)
+			rl.DrawCircleV(midB, r, color)
 		}
+	}
+
+	// Draw all coupling links (draw once per unique pair by only drawing when idA < idB).
+	for _, spline := range splines {
+		drawLinks(spline.HardCoupledIDs, spline, hardColor)
+		drawLinks(spline.SoftCoupledIDs, spline, softColor)
 	}
 
 	// Highlight the hovered spline.
@@ -1042,13 +1271,14 @@ func drawDebugLaneLines(cars []Car, splines []Spline, zoom float32) {
 			continue
 		}
 		currentSpline := splines[splineIdx]
-		if len(currentSpline.CoupledSplineIDs) == 0 {
+		allCoupled := append(append([]int(nil), currentSpline.HardCoupledIDs...), currentSpline.SoftCoupledIDs...)
+		if len(allCoupled) == 0 {
 			continue
 		}
 
 		carPos, _ := sampleSplineAtDistance(currentSpline, car.DistanceOnSpline)
 
-		for _, coupledID := range currentSpline.CoupledSplineIDs {
+		for _, coupledID := range allCoupled {
 			cIdx, ok := splineIndexByID[coupledID]
 			if !ok {
 				continue
@@ -1838,6 +2068,11 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 			}
 
 			targetSpeed := car.MaxSpeed * currentSpline.SpeedFactor
+			if currentSpline.SpeedLimitKmh > 0 {
+				if limitMPS := currentSpline.SpeedLimitKmh / 3.6; limitMPS < targetSpeed {
+					targetSpeed = limitMPS
+				}
+			}
 			if car.Braking {
 				targetSpeed = 0
 			} else if followCap < targetSpeed {
@@ -2088,6 +2323,9 @@ func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, route
 		} else {
 			statusText = "Click on a spline to set the cut point"
 		}
+	case ModeSpeedLimit:
+		modeText = "Speed limits"
+		statusText = "Left click applies selected speed limit, right click removes it"
 	}
 
 	hoverText := "none"
@@ -2105,8 +2343,8 @@ func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, route
 	}
 
 	rl.DrawText("Traffic spline editor", 24, 24, 22, text)
-	rl.DrawText("E: edit | R: route | P: priority | L: lane couple | C: cut spline | D: debug | N: random LC | F: force LC | Ctrl+S: save | Ctrl+O: open | Tab: cycle", 24, 54, 18, muted)
-	rl.DrawText("Priority splines are purple. Debug draws blame lines and lane-change projection lines.", 24, 78, 18, muted)
+	rl.DrawText("E: edit | R: route | P: priority | L: lane couple | C: cut | S: speed limits | D: debug | N: random LC | F: force LC | Ctrl+S: save | Ctrl+O: open | Tab: cycle", 24, 54, 18, muted)
+	rl.DrawText("Priority splines are purple. Lane coupling: left-click = hard (routing+LC, blue), right-click = soft (LC only, purple). Debug draws blame/LC lines.", 24, 78, 18, muted)
 	rl.DrawText(fmt.Sprintf("Mode: %s   Status: %s", modeText, statusText), 24, 108, 18, text)
 	rl.DrawText(fmt.Sprintf("Splines: %d   Routes: %d   Cars: %d   Hovered: %s   Debug: %s   Random LC: %s   Zoom: %.2fx   Scale: 1 unit = 1 m", splineCount, routeCount, carCount, hoverText, debugText, randLCText, zoom), 24, 132, 18, text)
 }
@@ -2551,7 +2789,7 @@ func findShortestPathWeighted(splines []Spline, startSplineID, endSplineID int, 
 			break
 		}
 		visited[u] = true
-		nextNodes := startsByNode[pointKey(splines[u].P3)]
+		nextNodes := expandWithCoupledNeighbors(startsByNode[pointKey(splines[u].P3)], splines, indexByID)
 		for _, v := range nextNodes {
 			alt := dist[u] + segmentTravelCost(splines[v], vehicleCounts)
 			if alt < dist[v] {
@@ -2606,6 +2844,28 @@ func chooseNextSplineOnBestPath(splines []Spline, currentSplineID, destinationSp
 		}
 	}
 	return bestSplineID, found
+}
+
+// expandWithCoupledNeighbors takes a slice of spline indices (direct neighbours
+// reachable by a physical P3→P0 connection) and appends the indices of any
+// splines that are coupled with those direct neighbours, without cascading
+// further (i.e. only one level of coupling is added).
+func expandWithCoupledNeighbors(indices []int, splines []Spline, indexByID map[int]int) []int {
+	seen := make(map[int]bool, len(indices)*2)
+	result := make([]int, 0, len(indices)*2)
+	for _, idx := range indices {
+		if !seen[idx] {
+			seen[idx] = true
+			result = append(result, idx)
+		}
+		for _, coupledID := range splines[idx].HardCoupledIDs {
+			if coupledIdx, ok := indexByID[coupledID]; ok && !seen[coupledIdx] {
+				seen[coupledIdx] = true
+				result = append(result, coupledIdx)
+			}
+		}
+	}
+	return result
 }
 
 func buildStartsByNode(splines []Spline) map[string][]int {
@@ -2813,7 +3073,9 @@ func saveSplineFile(splines []Spline, routes []Route, cars []Car, path string) e
 			P1:         spline.P1,
 			P2:         spline.P2,
 			P3:         spline.P3,
-			CoupledIDs: append([]int(nil), spline.CoupledSplineIDs...),
+			HardCoupledIDs: append([]int(nil), spline.HardCoupledIDs...),
+			SoftCoupledIDs: append([]int(nil), spline.SoftCoupledIDs...),
+			SpeedLimitKmh:  spline.SpeedLimitKmh,
 		})
 	}
 	for _, route := range routes {
@@ -2862,7 +3124,9 @@ func loadSplineFile(path string) ([]Spline, []Route, []Car, int, int, error) {
 	for _, entry := range saved.Splines {
 		spline := newSpline(entry.ID, entry.P0, entry.P1, entry.P2, entry.P3)
 		spline.Priority = entry.Priority
-		spline.CoupledSplineIDs = append([]int(nil), entry.CoupledIDs...)
+		spline.HardCoupledIDs = append([]int(nil), entry.HardCoupledIDs...)
+		spline.SoftCoupledIDs = append([]int(nil), entry.SoftCoupledIDs...)
+		spline.SpeedLimitKmh = entry.SpeedLimitKmh
 		loadedSplines = append(loadedSplines, spline)
 		if entry.ID > maxSplineID {
 			maxSplineID = entry.ID
