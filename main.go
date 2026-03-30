@@ -132,6 +132,8 @@ const (
 	maxCarSpeed               float32 = 36.1       // m/s — upper bound of car MaxSpeed range (130 km/h)
 	laneChangeForcedSpeedMPS  float32 = 20.0 / 3.6 // 20 km/h — speed for last-resort lane switch
 	laneChangeForcedDistEnd   float32 = 15.0       // metres before spline end where last-resort fires
+	curveSpeedIntervalM       float32 = 10.0       // arc-length spacing of curvature speed samples (m)
+	maxLateralAccelMPS2       float32 = 5.0        // max lateral acceleration for curve speed (m/s²)
 )
 
 type Spline struct {
@@ -149,8 +151,9 @@ type Spline struct {
 	CumLen         [simSamples + 1]float32
 	HardCoupledIDs []int   // parallel lanes that also act as pathfinding neighbours
 	SoftCoupledIDs []int   // parallel lanes used for lane-changes only, not routing
-	SpeedLimitKmh  float32 // 0 = no limit
-	LanePreference int     // 0 = none; lower = higher preference
+	SpeedLimitKmh  float32   // 0 = no limit
+	LanePreference int       // 0 = none; lower = higher preference
+	CurveSpeedMPS  []float32 // max speed at each curveSpeedIntervalM mark along the spline
 }
 
 type Draft struct {
@@ -220,10 +223,11 @@ type Car struct {
 	PrevSplineIDs       [2]int // last two splines before current; -1 = none
 	DistanceOnSpline    float32
 	Speed               float32
-	MaxSpeed            float32
-	Accel               float32
-	Length              float32
-	Width               float32
+	MaxSpeed             float32
+	Accel                float32
+	Length               float32
+	Width                float32
+	CurveSpeedMultiplier float32 // per-car multiplier on curvature speed limits (0.8–1.2)
 	Color               rl.Color
 	Braking             bool
 
@@ -300,9 +304,10 @@ type SavedCar struct {
 	DistanceOnSpline    float32 `json:"distance_on_spline"`
 	Speed               float32 `json:"speed"`
 	MaxSpeed            float32 `json:"max_speed"`
-	Accel               float32 `json:"accel"`
-	Length              float32 `json:"length"`
-	Width               float32 `json:"width"`
+	Accel                float32 `json:"accel"`
+	Length               float32 `json:"length"`
+	Width                float32 `json:"width"`
+	CurveSpeedMultiplier float32 `json:"curve_speed_multiplier,omitempty"`
 }
 
 func main() {
@@ -1835,10 +1840,11 @@ func spawnCar(route Route) Car {
 		PrevSplineIDs:       [2]int{-1, -1},
 		DistanceOnSpline:    0,
 		Speed:               randRange(0, 2),                     // m/s — starts nearly stationary
-		MaxSpeed:            randRange(13.9, 36.1),               // m/s — 50–130 km/h
+		MaxSpeed:            randRange(22.2, 36.1),               // m/s — 80–130 km/h
 		Accel:               randRange(2.5, 4.5),                 // m/s²
 		Length:              randRange(4.0, 4.8) / metersPerUnit, // world units
 		Width:               randRange(1.8, 2.0) / metersPerUnit, // world units
+		CurveSpeedMultiplier: randRange(0.8, 1.2),
 		Color:               route.Color,
 		Braking:             false,
 		LaneChangeSplineID:  -1,
@@ -2351,6 +2357,9 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 						preferredSpeed = limitMPS
 					}
 				}
+				if cs := lookupCurveSpeed(spline, car.DistanceOnSpline) * car.CurveSpeedMultiplier; cs < preferredSpeed {
+					preferredSpeed = cs
+				}
 				frustrated = preferredSpeed-car.Speed >= frustrateThreshMPS
 			}
 			if frustrated {
@@ -2373,6 +2382,12 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 				if limitMPS := currentSpline.SpeedLimitKmh / 3.6; limitMPS < targetSpeed {
 					targetSpeed = limitMPS
 				}
+			}
+			if cs := lookupCurveSpeed(currentSpline, car.DistanceOnSpline) * car.CurveSpeedMultiplier; cs < targetSpeed {
+				targetSpeed = cs
+			}
+			if at := computeAnticipatoryTargetSpeed(car, currentSpline, splines, vehicleCounts); at < targetSpeed {
+				targetSpeed = at
 			}
 			// If a forced lane switch is pending, begin decelerating to
 			// laneChangeForcedSpeedMPS in time to reach the deadline position.
@@ -2753,16 +2768,142 @@ func cacheSpline(s *Spline) {
 		prev = pt
 	}
 	s.Length = total
-	s.SpeedFactor = splineSpeedFactor(*s)
+	s.SpeedFactor = 1.0
+	s.CurveSpeedMPS = buildCurveSpeedProfile(s)
 }
 
-func splineSpeedFactor(s Spline) float32 {
-	startTangent := normalize(vecSub(s.P1, s.P0))
-	endTangent := normalize(vecSub(s.P3, s.P2))
-	d := clampf(dot(startTangent, endTangent), -1, 1)
-	angle := float32(math.Acos(float64(d)))
-	turnPenalty := angle / float32(math.Pi)
-	return 1.0 - 0.55*turnPenalty
+// buildCurveSpeedProfile computes the maximum speed at every curveSpeedIntervalM
+// metres along the spline. Speed is derived from the local radius of curvature
+// (circumradius of three consecutive sample points) and maxLateralAccelMPS2.
+func buildCurveSpeedProfile(s *Spline) []float32 {
+	if s.Length <= 0 {
+		return nil
+	}
+	count := int(s.Length/curveSpeedIntervalM) + 1
+	profile := make([]float32, count)
+	for i := range profile {
+		d := float32(i) * curveSpeedIntervalM
+		profile[i] = curveSpeedAtArcLen(s, d)
+	}
+	return profile
+}
+
+// curveSpeedAtArcLen returns the maximum speed at arc-length d based on local
+// curvature. Uses the circumradius of three neighbouring samples to estimate
+// the radius of curvature, then applies v = sqrt(maxLateralAccelMPS2 * r).
+func curveSpeedAtArcLen(s *Spline, d float32) float32 {
+	// Find sample index nearest to arc-length d.
+	idx := 0
+	for idx < simSamples && s.CumLen[idx+1] < d {
+		idx++
+	}
+	// Choose three consecutive samples, clamped to valid range.
+	i0, i1, i2 := idx-1, idx, idx+1
+	if i0 < 0 {
+		i0, i1, i2 = 0, 1, 2
+	}
+	if i2 > simSamples {
+		i0, i1, i2 = simSamples-2, simSamples-1, simSamples
+	}
+
+	A, B, C := s.Samples[i0], s.Samples[i1], s.Samples[i2]
+
+	ab := float32(math.Sqrt(float64(distSq(A, B))))
+	bc := float32(math.Sqrt(float64(distSq(B, C))))
+	ca := float32(math.Sqrt(float64(distSq(C, A))))
+
+	// |cross| = 2 * triangle area; circumradius r = (ab*bc*ca) / (2*|cross|)
+	cross := absf((B.X-A.X)*(C.Y-A.Y) - (B.Y-A.Y)*(C.X-A.X))
+	if cross < 1e-6 {
+		return maxCarSpeed // essentially straight
+	}
+	r := ab * bc * ca / (2 * cross)
+	v := float32(math.Sqrt(float64(maxLateralAccelMPS2 * r)))
+	if v > maxCarSpeed {
+		return maxCarSpeed
+	}
+	return v
+}
+
+// lookupCurveSpeed returns the precomputed curvature speed limit at the given
+// arc-length on the spline. Returns maxCarSpeed if no profile is available.
+func lookupCurveSpeed(spline Spline, dist float32) float32 {
+	if len(spline.CurveSpeedMPS) == 0 {
+		return maxCarSpeed
+	}
+	idx := int(dist / curveSpeedIntervalM)
+	if idx >= len(spline.CurveSpeedMPS) {
+		idx = len(spline.CurveSpeedMPS) - 1
+	}
+	return spline.CurveSpeedMPS[idx]
+}
+
+// computeAnticipatoryTargetSpeed looks ahead along the car's path and returns
+// the maximum speed the car should target NOW so that it can decelerate in time
+// for every upcoming speed constraint within lookahead range.
+//
+// For each constraint at distance d ahead with required speed v_req:
+//   allowed_now = sqrt(v_req² + 2·decel·d)
+//
+// The minimum across all checked points is returned.
+// Lookahead extends from the car's position to at most 150 m (or the braking
+// distance from current speed, whichever is smaller). If the lookahead reaches
+// the end of the current spline, the next most-likely spline is scanned too.
+func computeAnticipatoryTargetSpeed(car Car, currentSpline Spline, splines []Spline, vehicleCounts map[int]int) float32 {
+	decel := car.Accel * 1.5
+	// Look far enough to brake from the current speed, plus a couple of extra
+	// fragments as buffer. Cap at 150 m.
+	lookahead := car.Speed*car.Speed/(2*decel) + 2*curveSpeedIntervalM
+	if lookahead > 150 {
+		lookahead = 150
+	}
+
+	result := float32(math.MaxFloat32)
+	remaining := currentSpline.Length - car.DistanceOnSpline
+
+	checkConstraint := func(reqSpeed, distAhead float32) {
+		allowed := float32(math.Sqrt(float64(reqSpeed*reqSpeed + 2*decel*distAhead)))
+		if allowed < result {
+			result = allowed
+		}
+	}
+
+	splineReqSpeed := func(s Spline, pos float32) float32 {
+		spd := lookupCurveSpeed(s, pos) * car.CurveSpeedMultiplier
+		if s.SpeedLimitKmh > 0 {
+			if lim := s.SpeedLimitKmh / 3.6; lim < spd {
+				spd = lim
+			}
+		}
+		return spd
+	}
+
+	// Scan ahead on the current spline in curveSpeedIntervalM steps.
+	for d := curveSpeedIntervalM; d <= lookahead; d += curveSpeedIntervalM {
+		if d > remaining {
+			break
+		}
+		checkConstraint(splineReqSpeed(currentSpline, car.DistanceOnSpline+d), d)
+	}
+
+	// If the lookahead extends past the end of the current spline, scan the
+	// next most-likely spline from its beginning.
+	if remaining < lookahead {
+		nextID, ok := chooseNextSplineOnBestPath(splines, currentSpline.ID, car.DestinationSplineID, vehicleCounts)
+		if ok {
+			if nextSpline, ok2 := findSplineByID(splines, nextID); ok2 {
+				budget := lookahead - remaining
+				for pos := float32(0); pos <= minf(nextSpline.Length, budget); pos += curveSpeedIntervalM {
+					checkConstraint(splineReqSpeed(nextSpline, pos), remaining+pos)
+				}
+			}
+		}
+	}
+
+	if result == float32(math.MaxFloat32) {
+		return maxCarSpeed
+	}
+	return result
 }
 
 func buildPreview(stage Stage, draft Draft, mouse rl.Vector2, snapStart EndHit, splines []Spline) (Spline, bool) {
@@ -3450,10 +3591,11 @@ func saveSplineFile(splines []Spline, routes []Route, cars []Car, path string) e
 			DestinationSplineID: car.DestinationSplineID,
 			DistanceOnSpline:    car.DistanceOnSpline,
 			Speed:               car.Speed,
-			MaxSpeed:            car.MaxSpeed,
-			Accel:               car.Accel,
-			Length:              car.Length,
-			Width:               car.Width,
+			MaxSpeed:             car.MaxSpeed,
+			Accel:                car.Accel,
+			Length:               car.Length,
+			Width:                car.Width,
+			CurveSpeedMultiplier: car.CurveSpeedMultiplier,
 		})
 	}
 
@@ -3520,17 +3662,21 @@ func loadSplineFile(path string) ([]Spline, []Route, []Car, int, int, error) {
 			PrevSplineIDs:       [2]int{-1, -1},
 			DistanceOnSpline:    entry.DistanceOnSpline,
 			Speed:               entry.Speed,
-			MaxSpeed:            entry.MaxSpeed,
-			Accel:               entry.Accel,
-			Length:              entry.Length,
-			Width:               entry.Width,
-			Color:               routeColorByID[entry.RouteID],
+			MaxSpeed:             entry.MaxSpeed,
+			Accel:                entry.Accel,
+			Length:               entry.Length,
+			Width:                entry.Width,
+			CurveSpeedMultiplier: entry.CurveSpeedMultiplier,
+			Color:                routeColorByID[entry.RouteID],
 			Braking:             false,
 			LaneChangeSplineID:  -1,
 			AfterSplineID:       -1,
 
 			DesiredLaneSplineID: -1,
 			PreferenceCooldown:  rand.Float32() * preferenceChangeCooldownS,
+		}
+		if car.CurveSpeedMultiplier == 0 {
+			car.CurveSpeedMultiplier = randRange(0.8, 1.2)
 		}
 		loadedCars = append(loadedCars, car)
 	}
