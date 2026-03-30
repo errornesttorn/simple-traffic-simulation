@@ -478,6 +478,7 @@ func main() {
 
 	noticeText := ""
 	noticeTimer := float32(0)
+	routeVisualsTimer := float32(0)
 
 	for !rl.WindowShouldClose() {
 		dt := rl.GetFrameTime()
@@ -689,12 +690,16 @@ func main() {
 		hoveredStart := findNearbyStart(splines, mouseWorld, snapRadius)
 
 		vehicleCounts := buildVehicleCounts(cars)
-		routes = updateRouteVisuals(routes, splines, vehicleCounts)
+		routeVisualsTimer -= dt
+		if routeVisualsTimer <= 0 {
+			routes = updateRouteVisuals(routes, splines, vehicleCounts)
+			routeVisualsTimer = 0.5
+		}
 		laneChangeSplines, cars = computeLaneChanges(cars, splines, laneChangeSplines, &nextSplineID, vehicleCounts, dt)
 		allSplines := mergedSplines(splines, laneChangeSplines)
-		brakingDecisions, debugBlameLinks := computeBrakingDecisions(cars, allSplines, vehicleCounts)
+		brakingDecisions, holdSpeedDecisions, debugBlameLinks := computeBrakingDecisions(cars, allSplines, vehicleCounts)
 		followCaps := computeFollowingSpeedCaps(cars, allSplines, vehicleCounts)
-		cars = updateCars(cars, routes, allSplines, vehicleCounts, brakingDecisions, followCaps, trafficLights, trafficCycles, dt)
+		cars = updateCars(cars, routes, allSplines, vehicleCounts, brakingDecisions, holdSpeedDecisions, followCaps, trafficLights, trafficCycles, dt)
 		laneChangeSplines = gcLaneChangeSplines(laneChangeSplines, cars)
 		routes, cars = updateRouteSpawning(routes, cars, splines, dt)
 		trafficCycles = updateTrafficCycles(trafficCycles, dt)
@@ -988,11 +993,12 @@ func main() {
 		drawGrid(camera)
 		drawAxes(camera)
 
+		splineIndexByID := buildSplineIndexByID(splines)
 		for _, route := range routes {
 			if !route.Valid {
 				continue
 			}
-			drawRoute(route, splines, pixelsToWorld(camera.Zoom, 2.0), camera.Zoom)
+			drawRouteWithIndex(route, splines, splineIndexByID, pixelsToWorld(camera.Zoom, 2.0), camera.Zoom)
 		}
 
 		for i, spline := range splines {
@@ -1041,9 +1047,10 @@ func main() {
 		if mode == ModeCut {
 			drawCutMode(stage, cutDraft, splines, mouseWorld, camera.Zoom)
 		}
-		drawCars(cars, allSplines, camera.Zoom)
+		allSplineIndexByID := buildSplineIndexByID(allSplines)
+		drawCars(cars, allSplines, allSplineIndexByID, camera.Zoom)
 		if debugMode {
-			drawDebugBlameLinks(debugBlameLinks, cars, allSplines, camera.Zoom)
+			drawDebugBlameLinks(debugBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom)
 			drawLaneChangeSplines(laneChangeSplines, camera.Zoom)
 		}
 		drawTrafficLights(trafficLights, pendingLights, trafficCycles, editingCycleID, editingPhaseIdx, showPhaseIdx, camera.Zoom)
@@ -1064,7 +1071,7 @@ func main() {
 		}
 		if mode == ModeSpeedLimit {
 			drawSpeedLimitLabels(splines, camera)
-			drawCarSpeedLabels(cars, allSplines, camera)
+			drawCarSpeedLabels(cars, allSplines, allSplineIndexByID, camera)
 		}
 		if mode == ModePreference {
 			drawPreferenceLabels(splines, camera)
@@ -2473,13 +2480,14 @@ func mergedSplines(permanent, temporary []Spline) []Spline {
 // gcLaneChangeSplines removes any lane-change splines that no car is currently
 // travelling on, freeing memory and keeping the slice compact.
 func gcLaneChangeSplines(lcs []Spline, cars []Car) []Spline {
+	active := make(map[int]struct{}, len(cars))
+	for _, car := range cars {
+		active[car.LaneChangeSplineID] = struct{}{}
+	}
 	out := lcs[:0]
 	for _, lc := range lcs {
-		for _, car := range cars {
-			if car.LaneChangeSplineID == lc.ID {
-				out = append(out, lc)
-				break
-			}
+		if _, ok := active[lc.ID]; ok {
+			out = append(out, lc)
 		}
 	}
 	return out
@@ -3049,23 +3057,19 @@ func recentlyLeft(car Car, splineID int) bool {
 	return splineID >= 0 && (car.PrevSplineIDs[0] == splineID || car.PrevSplineIDs[1] == splineID)
 }
 
-func computeBrakingDecisions(cars []Car, splines []Spline, vehicleCounts map[int]int) ([]bool, []DebugBlameLink) {
+func computeBrakingDecisions(cars []Car, splines []Spline, vehicleCounts map[int]int) ([]bool, []bool, []DebugBlameLink) {
 	flags := make([]bool, len(cars))
+	holdSpeed := make([]bool, len(cars))
 	initialBlame := make([]bool, len(cars))
 	tentativeLinks := make([]DebugBlameLink, 0)
 	if len(cars) < 2 {
-		return flags, tentativeLinks
+		return flags, holdSpeed, tentativeLinks
 	}
 
 	predictions := make([][]TrajectorySample, len(cars))
-	stationaryPredictions := make([][]TrajectorySample, len(cars))
+	stationaryPredictions := make([][]TrajectorySample, len(cars)) // lazily populated on first blame check
 	for i, car := range cars {
 		predictions[i] = predictCarTrajectory(car, splines, vehicleCounts, predictionHorizonSeconds, predictionStepSeconds)
-		// Pre-compute stationary trajectory: car standing still at its current position.
-		// Used to filter out conflicts that braking cannot resolve.
-		stationaryCar := car
-		stationaryCar.Speed = 0
-		stationaryPredictions[i] = predictCarTrajectory(stationaryCar, splines, vehicleCounts, predictionHorizonSeconds, predictionStepSeconds)
 	}
 
 	for i := 0; i < len(cars); i++ {
@@ -3092,11 +3096,21 @@ func computeBrakingDecisions(cars []Car, splines []Spline, vehicleCounts map[int
 			// Suppress blame if the conflict would happen even when the blamed car is
 			// standing still — braking can never resolve such a conflict.
 			if blameI {
+				if stationaryPredictions[i] == nil {
+					sc := cars[i]
+					sc.Speed = 0
+					stationaryPredictions[i] = predictCarTrajectory(sc, splines, vehicleCounts, predictionHorizonSeconds, predictionStepSeconds)
+				}
 				if _, still := predictCollision(stationaryPredictions[i], predictions[j], cars[i], cars[j]); still {
 					blameI = false
 				}
 			}
 			if blameJ {
+				if stationaryPredictions[j] == nil {
+					sc := cars[j]
+					sc.Speed = 0
+					stationaryPredictions[j] = predictCarTrajectory(sc, splines, vehicleCounts, predictionHorizonSeconds, predictionStepSeconds)
+				}
 				if _, still := predictCollision(stationaryPredictions[j], predictions[i], cars[j], cars[i]); still {
 					blameJ = false
 				}
@@ -3121,6 +3135,47 @@ func computeBrakingDecisions(cars []Car, splines []Spline, vehicleCounts map[int
 		}
 	}
 
+	// For cars that are not braking, check whether they would be blamed for a
+	// collision if travelling slightly faster (current speed + 0.25s of acceleration).
+	// If so, hold the current speed rather than accelerating into the conflict.
+	for i, car := range cars {
+		if flags[i] || len(predictions[i]) == 0 {
+			continue
+		}
+		fasterCar := car
+		fasterCar.Speed += 0.25 * fasterCar.Accel
+		if fasterCar.Speed <= car.Speed+1e-4 {
+			continue // already at or near max — nothing to hold back
+		}
+		fasterPred := predictCarTrajectory(fasterCar, splines, vehicleCounts, predictionHorizonSeconds, predictionStepSeconds)
+		if len(fasterPred) == 0 {
+			continue
+		}
+		for j := range cars {
+			if i == j || len(predictions[j]) == 0 {
+				continue
+			}
+			collision, ok := predictCollision(fasterPred, predictions[j], fasterCar, cars[j])
+			if !ok {
+				continue
+			}
+			blameI, _ := determineBlame(collision, fasterCar, cars[j])
+			if blameI && !recentlyLeft(fasterCar, cars[j].CurrentSplineID) {
+				// Suppress if the collision is unavoidable even when standing still —
+				// consistent with how braking blame is suppressed above.
+				if stationaryPredictions[i] == nil {
+					sc := cars[i]
+					sc.Speed = 0
+					stationaryPredictions[i] = predictCarTrajectory(sc, splines, vehicleCounts, predictionHorizonSeconds, predictionStepSeconds)
+				}
+				if _, still := predictCollision(stationaryPredictions[i], predictions[j], cars[i], cars[j]); !still {
+					holdSpeed[i] = true
+					break
+				}
+			}
+		}
+	}
+
 	debugLinks := make([]DebugBlameLink, 0, len(tentativeLinks))
 	for _, link := range tentativeLinks {
 		if link.FromCarIndex >= 0 && link.FromCarIndex < len(flags) && flags[link.FromCarIndex] {
@@ -3128,7 +3183,7 @@ func computeBrakingDecisions(cars []Car, splines []Spline, vehicleCounts map[int
 		}
 	}
 
-	return flags, debugLinks
+	return flags, holdSpeed, debugLinks
 }
 
 func shouldBrakeForBlamedConflicts(carIndex int, cars []Car, splines []Spline, vehicleCounts map[int]int, predictions [][]TrajectorySample) bool {
@@ -3507,7 +3562,7 @@ func computeFollowingSpeedCaps(cars []Car, splines []Spline, vehicleCounts map[i
 	return caps
 }
 
-func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[int]int, brakingDecisions []bool, followCaps []float32, lights []TrafficLight, cycles []TrafficCycle, dt float32) []Car {
+func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[int]int, brakingDecisions []bool, holdSpeedDecisions []bool, followCaps []float32, lights []TrafficLight, cycles []TrafficCycle, dt float32) []Car {
 	if len(cars) == 0 {
 		return cars
 	}
@@ -3525,6 +3580,7 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 		}
 
 		shouldBrake := i < len(brakingDecisions) && brakingDecisions[i]
+		shouldHoldSpeed := !shouldBrake && i < len(holdSpeedDecisions) && holdSpeedDecisions[i]
 		car.Braking = shouldBrake
 
 		followCap := float32(math.MaxFloat32)
@@ -3600,6 +3656,9 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 			} else if followCap < targetSpeed {
 				// Following distance: don't accelerate beyond leader's speed.
 				targetSpeed = followCap
+			}
+			if shouldHoldSpeed && targetSpeed > car.Speed {
+				targetSpeed = car.Speed
 			}
 
 			if car.Speed < targetSpeed {
@@ -3678,11 +3737,10 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 	return alive
 }
 
-func drawCars(cars []Car, splines []Spline, zoom float32) {
+func drawCars(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom float32) {
 	if len(cars) == 0 {
 		return
 	}
-	splineIndexByID := buildSplineIndexByID(splines)
 	for _, car := range cars {
 		splineIdx, ok := splineIndexByID[car.CurrentSplineID]
 		if !ok {
@@ -3701,8 +3759,7 @@ func drawCars(cars []Car, splines []Spline, zoom float32) {
 
 // drawCarSpeedLabels draws each car's current speed in km/h in screen space,
 // centred just above the car's position.
-func drawCarSpeedLabels(cars []Car, splines []Spline, camera rl.Camera2D) {
-	splineIndexByID := buildSplineIndexByID(splines)
+func drawCarSpeedLabels(cars []Car, splines []Spline, splineIndexByID map[int]int, camera rl.Camera2D) {
 	fontSize := int32(12)
 	for _, car := range cars {
 		splineIdx, ok := splineIndexByID[car.CurrentSplineID]
@@ -3717,12 +3774,11 @@ func drawCarSpeedLabels(cars []Car, splines []Spline, camera rl.Camera2D) {
 	}
 }
 
-func drawDebugBlameLinks(links []DebugBlameLink, cars []Car, splines []Spline, zoom float32) {
+func drawDebugBlameLinks(links []DebugBlameLink, cars []Car, splines []Spline, splineIndexByID map[int]int, zoom float32) {
 	if len(links) == 0 || len(cars) == 0 {
 		return
 	}
 
-	splineIndexByID := buildSplineIndexByID(splines)
 	lineColor := rl.NewColor(220, 50, 50, 220)
 	lineThickness := pixelsToWorld(zoom, 2.0)
 
@@ -3744,8 +3800,7 @@ func drawDebugBlameLinks(links []DebugBlameLink, cars []Car, splines []Spline, z
 	}
 }
 
-func drawRoute(route Route, splines []Spline, thickness float32, zoom float32) {
-	indexByID := buildSplineIndexByID(splines)
+func drawRouteWithIndex(route Route, splines []Spline, indexByID map[int]int, thickness float32, zoom float32) {
 	color := rl.NewColor(route.Color.R, route.Color.G, route.Color.B, 90)
 	for _, pathID := range route.PathIDs {
 		idx, ok := indexByID[pathID]
@@ -3762,6 +3817,10 @@ func drawRoute(route Route, splines []Spline, thickness float32, zoom float32) {
 	if end, ok := findSplineByID(splines, route.EndSplineID); ok {
 		drawEndpoint(end.P3, destR, color)
 	}
+}
+
+func drawRoute(route Route, splines []Spline, thickness float32, zoom float32) {
+	drawRouteWithIndex(route, splines, buildSplineIndexByID(splines), thickness, zoom)
 }
 
 func drawRoutePicking(routeStartSplineID int, routePanel RoutePanel, hoveredStart EndHit, hoveredEnd EndHit, splines []Spline, vehicleCounts map[int]int, zoom float32) {
