@@ -697,7 +697,7 @@ func main() {
 		}
 		laneChangeSplines, cars = computeLaneChanges(cars, splines, laneChangeSplines, &nextSplineID, vehicleCounts, dt)
 		allSplines := mergedSplines(splines, laneChangeSplines)
-		brakingDecisions, holdSpeedDecisions, debugBlameLinks := computeBrakingDecisions(cars, allSplines, vehicleCounts)
+		brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks := computeBrakingDecisions(cars, allSplines, vehicleCounts)
 		followCaps := computeFollowingSpeedCaps(cars, allSplines, vehicleCounts)
 		cars = updateCars(cars, routes, allSplines, vehicleCounts, brakingDecisions, holdSpeedDecisions, followCaps, trafficLights, trafficCycles, dt)
 		laneChangeSplines = gcLaneChangeSplines(laneChangeSplines, cars)
@@ -1050,7 +1050,8 @@ func main() {
 		allSplineIndexByID := buildSplineIndexByID(allSplines)
 		drawCars(cars, allSplines, allSplineIndexByID, camera.Zoom)
 		if debugMode {
-			drawDebugBlameLinks(debugBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom)
+			drawDebugBlameLinks(debugBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, rl.NewColor(220, 50, 50, 220))
+			drawDebugBlameLinks(holdBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, rl.NewColor(255, 165, 0, 220))
 			drawLaneChangeSplines(laneChangeSplines, camera.Zoom)
 		}
 		drawTrafficLights(trafficLights, pendingLights, trafficCycles, editingCycleID, editingPhaseIdx, showPhaseIdx, camera.Zoom)
@@ -3057,13 +3058,14 @@ func recentlyLeft(car Car, splineID int) bool {
 	return splineID >= 0 && (car.PrevSplineIDs[0] == splineID || car.PrevSplineIDs[1] == splineID)
 }
 
-func computeBrakingDecisions(cars []Car, splines []Spline, vehicleCounts map[int]int) ([]bool, []bool, []DebugBlameLink) {
+func computeBrakingDecisions(cars []Car, splines []Spline, vehicleCounts map[int]int) ([]bool, []bool, []DebugBlameLink, []DebugBlameLink) {
 	flags := make([]bool, len(cars))
 	holdSpeed := make([]bool, len(cars))
 	initialBlame := make([]bool, len(cars))
 	tentativeLinks := make([]DebugBlameLink, 0)
+	holdLinks := make([]DebugBlameLink, 0)
 	if len(cars) < 2 {
-		return flags, holdSpeed, tentativeLinks
+		return flags, holdSpeed, tentativeLinks, holdLinks
 	}
 
 	predictions := make([][]TrajectorySample, len(cars))
@@ -3170,6 +3172,7 @@ func computeBrakingDecisions(cars []Car, splines []Spline, vehicleCounts map[int
 				}
 				if _, still := predictCollision(stationaryPredictions[i], predictions[j], cars[i], cars[j]); !still {
 					holdSpeed[i] = true
+					holdLinks = append(holdLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
 					break
 				}
 			}
@@ -3183,7 +3186,7 @@ func computeBrakingDecisions(cars []Car, splines []Spline, vehicleCounts map[int
 		}
 	}
 
-	return flags, holdSpeed, debugLinks
+	return flags, holdSpeed, debugLinks, holdLinks
 }
 
 func shouldBrakeForBlamedConflicts(carIndex int, cars []Car, splines []Spline, vehicleCounts map[int]int, predictions [][]TrajectorySample) bool {
@@ -3774,12 +3777,11 @@ func drawCarSpeedLabels(cars []Car, splines []Spline, splineIndexByID map[int]in
 	}
 }
 
-func drawDebugBlameLinks(links []DebugBlameLink, cars []Car, splines []Spline, splineIndexByID map[int]int, zoom float32) {
+func drawDebugBlameLinks(links []DebugBlameLink, cars []Car, splines []Spline, splineIndexByID map[int]int, zoom float32, lineColor rl.Color) {
 	if len(links) == 0 || len(cars) == 0 {
 		return
 	}
 
-	lineColor := rl.NewColor(220, 50, 50, 220)
 	lineThickness := pixelsToWorld(zoom, 2.0)
 
 	for _, link := range links {
