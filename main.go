@@ -151,8 +151,8 @@ type Spline struct {
 	SpeedFactor    float32
 	Samples        [simSamples + 1]rl.Vector2
 	CumLen         [simSamples + 1]float32
-	HardCoupledIDs []int   // parallel lanes that also act as pathfinding neighbours
-	SoftCoupledIDs []int   // parallel lanes used for lane-changes only, not routing
+	HardCoupledIDs []int     // parallel lanes that also act as pathfinding neighbours
+	SoftCoupledIDs []int     // parallel lanes used for lane-changes only, not routing
 	SpeedLimitKmh  float32   // 0 = no limit
 	LanePreference int       // 0 = none; lower = higher preference
 	CurveSpeedMPS  []float32 // max speed at each curveSpeedIntervalM mark along the spline
@@ -220,18 +220,18 @@ type RoutePanel struct {
 type Car struct {
 	RouteID int
 
-	CurrentSplineID     int
-	DestinationSplineID int
-	PrevSplineIDs       [2]int // last two splines before current; -1 = none
-	DistanceOnSpline    float32
-	Speed               float32
+	CurrentSplineID      int
+	DestinationSplineID  int
+	PrevSplineIDs        [2]int // last two splines before current; -1 = none
+	DistanceOnSpline     float32
+	Speed                float32
 	MaxSpeed             float32
 	Accel                float32
 	Length               float32
 	Width                float32
 	CurveSpeedMultiplier float32 // per-car multiplier on curvature speed limits (0.8–1.2)
-	Color               rl.Color
-	Braking             bool
+	Color                rl.Color
+	Braking              bool
 
 	// Lane-change state.
 	LaneChanging       bool
@@ -295,9 +295,10 @@ type SavedTrafficPhase struct {
 }
 
 type SavedTrafficCycle struct {
-	ID      int                 `json:"id"`
-	Enabled bool                `json:"enabled"`
-	Phases  []SavedTrafficPhase `json:"phases,omitempty"`
+	ID                 int                 `json:"id"`
+	Enabled            bool                `json:"enabled"`
+	YellowDurationSecs float32             `json:"yellow_duration_secs,omitempty"`
+	Phases             []SavedTrafficPhase `json:"phases,omitempty"`
 }
 
 type SavedSpline struct {
@@ -322,12 +323,12 @@ type SavedRoute struct {
 }
 
 type SavedCar struct {
-	RouteID             int     `json:"route_id"`
-	CurrentSplineID     int     `json:"current_spline_id"`
-	DestinationSplineID int     `json:"destination_spline_id"`
-	DistanceOnSpline    float32 `json:"distance_on_spline"`
-	Speed               float32 `json:"speed"`
-	MaxSpeed            float32 `json:"max_speed"`
+	RouteID              int     `json:"route_id"`
+	CurrentSplineID      int     `json:"current_spline_id"`
+	DestinationSplineID  int     `json:"destination_spline_id"`
+	DistanceOnSpline     float32 `json:"distance_on_spline"`
+	Speed                float32 `json:"speed"`
+	MaxSpeed             float32 `json:"max_speed"`
 	Accel                float32 `json:"accel"`
 	Length               float32 `json:"length"`
 	Width                float32 `json:"width"`
@@ -361,12 +362,13 @@ type TrafficPhase struct {
 
 // TrafficCycle groups lights that share a timed phase sequence.
 type TrafficCycle struct {
-	ID         int
-	LightIDs   []int
-	Phases     []TrafficPhase
-	Timer      float32
-	PhaseIndex int  // which phase is currently active
-	Enabled    bool // when false the cycle is paused and all lights show red
+	ID                 int
+	LightIDs           []int
+	Phases             []TrafficPhase
+	Timer              float32
+	PhaseIndex         int     // which phase is currently active
+	Enabled            bool    // when false the cycle is paused and all lights show red
+	YellowDurationSecs float32 // duration of the yellow transition between phases (default 3s)
 }
 
 // ---------- ui font ----------
@@ -462,17 +464,17 @@ func main() {
 	lastPref := 0
 	nextSplineID := 1
 	nextRouteID := 1
-	nextLightID   := 1
-	nextCycleID   := 1
+	nextLightID := 1
+	nextCycleID := 1
 	trafficLights := make([]TrafficLight, 0)
 	trafficCycles := make([]TrafficCycle, 0)
 	pendingLights := make([]TrafficLight, 0)
-	editingCycleID   := -1    // >= 0 when a cycle is open in the panel
-	editingLights    := false // true when the "Edit Lights" sub-mode is active
-	editingPhaseIdx  := -1    // >= 0 when a phase's light states are being toggled
-	activeDurInput   := -1    // >= 0 = phase index whose duration field is active
-	durInputStr      := ""    // current text in the active duration input
-	showPhaseIdx     := -1    // >= 0 = phase being previewed via Show button
+	editingCycleID := -1   // >= 0 when a cycle is open in the panel
+	editingLights := false // true when the "Edit Lights" sub-mode is active
+	editingPhaseIdx := -1  // >= 0 when a phase's light states are being toggled
+	activeDurInput := -1   // >= 0 = phase index whose duration field is active
+	durInputStr := ""      // current text in the active duration input
+	showPhaseIdx := -1     // >= 0 = phase being previewed via Show button
 
 	noticeText := ""
 	noticeTimer := float32(0)
@@ -773,7 +775,7 @@ func main() {
 				}
 
 				// ── duration text input ───────────────────────────────────
-				if activeDurInput >= 0 {
+				if activeDurInput != -1 {
 					for {
 						ch := rl.GetCharPressed()
 						if ch == 0 {
@@ -799,13 +801,14 @@ func main() {
 							if c.ID != editingCycleID {
 								continue
 							}
-							if activeDurInput < len(c.Phases) {
-								row := getPhaseRowBtns(pr, activeDurInput)
-								if !rl.CheckCollisionPointRec(mouseScreen, row.durField) {
-									trafficCycles = commitDurInput(trafficCycles, editingCycleID, activeDurInput, durInputStr)
-									activeDurInput = -1
-									durInputStr = ""
-								}
+							activeField := yellowDurFieldRect(pr)
+							if activeDurInput >= 0 && activeDurInput < len(c.Phases) {
+								activeField = getPhaseRowBtns(pr, activeDurInput).durField
+							}
+							if !rl.CheckCollisionPointRec(mouseScreen, activeField) {
+								trafficCycles = commitDurInput(trafficCycles, editingCycleID, activeDurInput, durInputStr)
+								activeDurInput = -1
+								durInputStr = ""
 							}
 							_ = ci
 							break
@@ -926,6 +929,22 @@ func main() {
 										showPhaseIdx = -1
 									} else if showPhaseIdx > pi {
 										showPhaseIdx--
+									}
+								}
+							}
+						}
+						// Yellow duration field (only when cycle is off and has >1 phase)
+						if !cycleIsOn && phaseCount > 1 {
+							if rl.CheckCollisionPointRec(mouseScreen, yellowDurFieldRect(pr)) {
+								for _, c := range trafficCycles {
+									if c.ID == editingCycleID {
+										activeDurInput = -2
+										yellowDur := c.YellowDurationSecs
+										if yellowDur <= 0 {
+											yellowDur = 3.0
+										}
+										durInputStr = fmt.Sprintf("%.1f", yellowDur)
+										break
 									}
 								}
 							}
@@ -1262,18 +1281,19 @@ func doCreateTrafficCycle(pending []TrafficLight, lights []TrafficLight, cycles 
 		lights = append(lights, l)
 	}
 	cycles = append(cycles, TrafficCycle{
-		ID:         cycleID,
-		LightIDs:   ids,
-		Phases:     nil,
-		Timer:      0,
-		PhaseIndex: 0,
-		Enabled:    false,
+		ID:                 cycleID,
+		LightIDs:           ids,
+		Phases:             nil,
+		Timer:              0,
+		PhaseIndex:         0,
+		Enabled:            false,
+		YellowDurationSecs: 3.0,
 	})
 	return pending[:0], lights, cycles, cycleID
 }
 
 // effectivePhaseDur returns the duration of effective phase index ei in a cycle.
-// When n > 1, even ei = user phase, odd ei = 1-second transition.
+// When n > 1, even ei = user phase, odd ei = yellow transition (YellowDurationSecs).
 // When n == 1, there is only one effective phase (the single user phase).
 func effectivePhaseDur(c *TrafficCycle, ei int) float32 {
 	n := len(c.Phases)
@@ -1290,7 +1310,11 @@ func effectivePhaseDur(c *TrafficCycle, ei int) float32 {
 		}
 		return dur
 	}
-	return 1.0 // transition phase
+	yellowDur := c.YellowDurationSecs
+	if yellowDur <= 0 {
+		yellowDur = 3.0
+	}
+	return yellowDur
 }
 
 func effectivePhaseCount(c *TrafficCycle) int {
@@ -1416,7 +1440,7 @@ func trafficCyclePanelRect(editing bool, phaseCount, pendingCount int) rl.Rectan
 		if rows == 0 {
 			rows = 1
 		}
-		h = 44 + 36 + float32(rows)*52 + 44
+		h = 44 + 36 + float32(rows)*52 + 74
 	}
 	return rl.NewRectangle(x, y, trafficPanelW, h)
 }
@@ -1429,9 +1453,9 @@ func trafficCreateBtnRect(pendingCount int) rl.Rectangle {
 
 // trafficHeaderBtnRects returns [On/Off], [Edit Lights] and [Close] in the cycle-editor header.
 func trafficHeaderBtnRects(pr rl.Rectangle) (onOffBtn, editLightsBtn, closeBtn rl.Rectangle) {
-	closeBtn      = rl.NewRectangle(pr.X+pr.Width-12-48, pr.Y+8, 48, 26)
+	closeBtn = rl.NewRectangle(pr.X+pr.Width-12-48, pr.Y+8, 48, 26)
 	editLightsBtn = rl.NewRectangle(pr.X+pr.Width-12-48-6-72, pr.Y+8, 72, 26)
-	onOffBtn      = rl.NewRectangle(pr.X+pr.Width-12-48-6-72-6-46, pr.Y+8, 46, 26)
+	onOffBtn = rl.NewRectangle(pr.X+pr.Width-12-48-6-72-6-46, pr.Y+8, 46, 26)
 	return
 }
 
@@ -1452,17 +1476,22 @@ type phaseRowBtns struct {
 // Each row is 52px tall: label+dur on top 24px, buttons on bottom 22px.
 func getPhaseRowBtns(pr rl.Rectangle, idx int) phaseRowBtns {
 	rowY := pr.Y + 78 + float32(idx)*52
-	x    := pr.X + 12
+	x := pr.X + 12
 	return phaseRowBtns{
 		// sub-row 1: duration field right-aligned
 		durField: rl.NewRectangle(pr.X+pr.Width-66, rowY+2, 48, 20),
 		// sub-row 2: buttons left-to-right
-		upBtn:   rl.NewRectangle(x,     rowY+26, 32, 20),
-		downBtn: rl.NewRectangle(x+36,  rowY+26, 38, 20),
-		showBtn: rl.NewRectangle(x+84,  rowY+26, 36, 20),
+		upBtn:   rl.NewRectangle(x, rowY+26, 32, 20),
+		downBtn: rl.NewRectangle(x+36, rowY+26, 38, 20),
+		showBtn: rl.NewRectangle(x+84, rowY+26, 36, 20),
 		editBtn: rl.NewRectangle(x+124, rowY+26, 42, 20),
 		delBtn:  rl.NewRectangle(x+170, rowY+26, 44, 20),
 	}
+}
+
+// yellowDurFieldRect returns the rect for the yellow-duration input in the panel footer.
+func yellowDurFieldRect(pr rl.Rectangle) rl.Rectangle {
+	return rl.NewRectangle(pr.X+pr.Width-66, pr.Y+pr.Height-52, 48, 20)
 }
 
 func drawSmallBtn(r rl.Rectangle, label string, bg, fg rl.Color) {
@@ -1474,11 +1503,11 @@ func drawSmallBtn(r rl.Rectangle, label string, bg, fg rl.Color) {
 
 func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles []TrafficCycle,
 	editingCycleID int, editingLights bool, editingPhaseIdx, activeDurInput int, durInputStr string, showPhaseIdx int) {
-	bg      := rl.NewColor(248, 248, 250, 245)
+	bg := rl.NewColor(248, 248, 250, 245)
 	outline := rl.NewColor(210, 210, 215, 255)
-	dark    := rl.NewColor(28, 28, 33, 255)
-	muted   := rl.NewColor(100, 100, 110, 255)
-	sep     := rl.NewColor(220, 220, 224, 255)
+	dark := rl.NewColor(28, 28, 33, 255)
+	muted := rl.NewColor(100, 100, 110, 255)
+	sep := rl.NewColor(220, 220, 224, 255)
 	disabledFg := rl.NewColor(170, 170, 178, 255)
 	disabledBg := rl.NewColor(220, 220, 224, 255)
 
@@ -1543,7 +1572,7 @@ func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles
 	onOffBg := rl.NewColor(190, 50, 50, 255)
 	onOffLbl := "Off"
 	if cycleOn {
-		onOffBg  = rl.NewColor(47, 140, 60, 255)
+		onOffBg = rl.NewColor(47, 140, 60, 255)
 		onOffLbl = "On"
 	}
 	drawSmallBtn(onOffBtn, onOffLbl, onOffBg, rl.White)
@@ -1581,7 +1610,7 @@ func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles
 		drawText("No phases yet", int32(pr.X)+12, int32(pr.Y)+80, 13, muted)
 	} else {
 		for pi, phase := range cycle.Phases {
-			row  := getPhaseRowBtns(pr, pi)
+			row := getPhaseRowBtns(pr, pi)
 			rowY := int32(pr.Y) + 78 + int32(pi)*52
 
 			// Determine whether this row is the current or transitioning-out phase.
@@ -1647,12 +1676,12 @@ func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles
 			// Sub-row 2: action buttons
 			if cycleOn {
 				// Disabled Up/Down/Edit/Delete
-				drawSmallBtn(row.upBtn,   "Up",     disabledBg, disabledFg)
-				drawSmallBtn(row.downBtn, "Down",   disabledBg, disabledFg)
-				drawSmallBtn(row.editBtn, "Edit",   disabledBg, disabledFg)
-				drawSmallBtn(row.delBtn,  "Delete", disabledBg, disabledFg)
+				drawSmallBtn(row.upBtn, "Up", disabledBg, disabledFg)
+				drawSmallBtn(row.downBtn, "Down", disabledBg, disabledFg)
+				drawSmallBtn(row.editBtn, "Edit", disabledBg, disabledFg)
+				drawSmallBtn(row.delBtn, "Delete", disabledBg, disabledFg)
 			} else {
-				upBg   := rl.NewColor(200, 200, 205, 255)
+				upBg := rl.NewColor(200, 200, 205, 255)
 				downBg := rl.NewColor(200, 200, 205, 255)
 				if pi == 0 {
 					upBg = disabledBg
@@ -1660,18 +1689,18 @@ func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles
 				if pi == len(cycle.Phases)-1 {
 					downBg = disabledBg
 				}
-				drawSmallBtn(row.upBtn,   "Up",     upBg,   dark)
-				drawSmallBtn(row.downBtn, "Down",   downBg, dark)
+				drawSmallBtn(row.upBtn, "Up", upBg, dark)
+				drawSmallBtn(row.downBtn, "Down", downBg, dark)
 
 				editActive := editingPhaseIdx == pi
 				editBg := rl.NewColor(47, 96, 198, 255)
 				editLbl := "Edit"
 				if editActive {
-					editBg  = rl.NewColor(28, 62, 155, 255)
+					editBg = rl.NewColor(28, 62, 155, 255)
 					editLbl = "Done"
 				}
 				drawSmallBtn(row.editBtn, editLbl, editBg, rl.White)
-				drawSmallBtn(row.delBtn,  "Delete", rl.NewColor(200, 60, 60, 255), rl.White)
+				drawSmallBtn(row.delBtn, "Delete", rl.NewColor(200, 60, 60, 255), rl.White)
 			}
 
 			// Show (cycle off) / Skip (cycle on) button
@@ -1686,6 +1715,42 @@ func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles
 				drawSmallBtn(row.showBtn, "Show", showBg, rl.White)
 			}
 		}
+	}
+
+	// ── Yellow transition duration footer ────────────────────────────────
+	if len(cycle.Phases) > 1 {
+		footerY := int32(pr.Y+pr.Height) - 68
+		rl.DrawLineEx(rl.NewVector2(pr.X+1, float32(footerY)), rl.NewVector2(pr.X+pr.Width-1, float32(footerY)), 1, sep)
+		yellowColor := rl.NewColor(180, 120, 0, 255)
+		drawText("Yellow phase:", int32(pr.X)+12, footerY+8, 12, yellowColor)
+
+		yellowDur := cycle.YellowDurationSecs
+		if yellowDur <= 0 {
+			yellowDur = 3.0
+		}
+		yField := yellowDurFieldRect(pr)
+		fieldBg := rl.NewColor(255, 255, 255, 255)
+		if cycleOn {
+			fieldBg = rl.NewColor(235, 235, 238, 255)
+		} else if activeDurInput == -2 {
+			fieldBg = rl.NewColor(240, 248, 255, 255)
+		}
+		rl.DrawRectangleRec(yField, fieldBg)
+		rl.DrawRectangleLinesEx(yField, 1, rl.NewColor(180, 180, 190, 255))
+		yDurStr := fmt.Sprintf("%.1f", yellowDur)
+		if !cycleOn && activeDurInput == -2 {
+			yDurStr = durInputStr
+		}
+		yDurColor := dark
+		if cycleOn {
+			yDurColor = disabledFg
+		}
+		drawText(yDurStr, int32(yField.X)+4, int32(yField.Y)+3, 12, yDurColor)
+		if !cycleOn && activeDurInput == -2 {
+			cw := measureText(yDurStr, 12)
+			rl.DrawRectangle(int32(yField.X)+4+cw+1, int32(yField.Y)+3, 1, 14, dark)
+		}
+		drawText("s", int32(yField.X)+int32(yField.Width)+3, int32(yField.Y)+3, 12, muted)
 	}
 }
 
@@ -1709,7 +1774,9 @@ func commitDurInput(cycles []TrafficCycle, cycleID, phaseIdx int, str string) []
 		if cycles[i].ID != cycleID {
 			continue
 		}
-		if phaseIdx >= 0 && phaseIdx < len(cycles[i].Phases) {
+		if phaseIdx == -2 {
+			cycles[i].YellowDurationSecs = float32(val)
+		} else if phaseIdx >= 0 && phaseIdx < len(cycles[i].Phases) {
 			cycles[i].Phases[phaseIdx].DurationSecs = float32(val)
 		}
 		break
@@ -2954,21 +3021,21 @@ func spawnCar(route Route) Car {
 	// Speed range: ~50-130 km/h = 13.9-36.1 m/s.
 	// Acceleration: 2.5-4.5 m/s² (comfortable urban driving).
 	return Car{
-		RouteID:             route.ID,
-		CurrentSplineID:     route.StartSplineID,
-		DestinationSplineID: route.EndSplineID,
-		PrevSplineIDs:       [2]int{-1, -1},
-		DistanceOnSpline:    0,
-		Speed:               randRange(0, 2),                     // m/s — starts nearly stationary
-		MaxSpeed:            randRange(22.2, 36.1),               // m/s — 80–130 km/h
-		Accel:               randRange(2.5, 4.5),                 // m/s²
-		Length:              randRange(4.0, 4.8) / metersPerUnit, // world units
-		Width:               randRange(1.8, 2.0) / metersPerUnit, // world units
+		RouteID:              route.ID,
+		CurrentSplineID:      route.StartSplineID,
+		DestinationSplineID:  route.EndSplineID,
+		PrevSplineIDs:        [2]int{-1, -1},
+		DistanceOnSpline:     0,
+		Speed:                randRange(0, 2),                     // m/s — starts nearly stationary
+		MaxSpeed:             randRange(22.2, 36.1),               // m/s — 80–130 km/h
+		Accel:                randRange(2.5, 4.5),                 // m/s²
+		Length:               randRange(4.0, 4.8) / metersPerUnit, // world units
+		Width:                randRange(1.8, 2.0) / metersPerUnit, // world units
 		CurveSpeedMultiplier: randRange(0.8, 1.2),
-		Color:               route.Color,
-		Braking:             false,
-		LaneChangeSplineID:  -1,
-		AfterSplineID:       -1,
+		Color:                route.Color,
+		Braking:              false,
+		LaneChangeSplineID:   -1,
+		AfterSplineID:        -1,
 
 		DesiredLaneSplineID: -1,
 		PreferenceCooldown:  rand.Float32() * preferenceChangeCooldownS,
@@ -3816,13 +3883,13 @@ func modeStatusText(mode EditorMode, stage Stage, draft Draft, routeStartSplineI
 func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, routeStartSplineID int, coupleModeFirstID int, debugMode bool, zoom float32, splineCount, routeCount, carCount int) {
 	mouse := rl.GetMousePosition()
 
-	bgNormal  := rl.NewColor(245, 245, 248, 245)
-	bgActive  := rl.NewColor(47, 96, 198, 255)
-	bgHover   := rl.NewColor(218, 224, 238, 245)
+	bgNormal := rl.NewColor(245, 245, 248, 245)
+	bgActive := rl.NewColor(47, 96, 198, 255)
+	bgHover := rl.NewColor(218, 224, 238, 245)
 	outNormal := rl.NewColor(200, 200, 206, 255)
 	outActive := rl.NewColor(28, 62, 155, 255)
-	txtDark   := rl.NewColor(28, 28, 33, 255)
-	txtMuted  := rl.NewColor(100, 100, 110, 255)
+	txtDark := rl.NewColor(28, 28, 33, 255)
+	txtMuted := rl.NewColor(100, 100, 110, 255)
 
 	for i, item := range toolbarItems {
 		r := toolbarBtnRect(i)
@@ -4081,7 +4148,8 @@ func computeTrafficLightSpeedCap(car Car, currentSpline Spline, splines []Spline
 // for every upcoming speed constraint within lookahead range.
 //
 // For each constraint at distance d ahead with required speed v_req:
-//   allowed_now = sqrt(v_req² + 2·decel·d)
+//
+//	allowed_now = sqrt(v_req² + 2·decel·d)
 //
 // The minimum across all checked points is returned.
 // Lookahead extends from the car's position to at most 150 m (or the braking
@@ -4305,11 +4373,11 @@ func drawGrid(camera rl.Camera2D) {
 	zoom := camera.Zoom
 
 	type level struct {
-		spacing  float32
-		color    rl.Color
-		pxThick  float32 // constant screen-pixel thickness
-		showMin  float32 // only show when zoom >= showMin (0 = no minimum)
-		showMax  float32 // only show when zoom <= showMax (0 = no maximum)
+		spacing float32
+		color   rl.Color
+		pxThick float32 // constant screen-pixel thickness
+		showMin float32 // only show when zoom >= showMin (0 = no minimum)
+		showMax float32 // only show when zoom <= showMax (0 = no maximum)
 	}
 
 	// Draw thinnest first so thicker lines paint on top.
@@ -4838,11 +4906,11 @@ func saveSplineFile(splines []Spline, routes []Route, cars []Car, lights []Traff
 	}
 	for _, car := range cars {
 		saved.Cars = append(saved.Cars, SavedCar{
-			RouteID:             car.RouteID,
-			CurrentSplineID:     car.CurrentSplineID,
-			DestinationSplineID: car.DestinationSplineID,
-			DistanceOnSpline:    car.DistanceOnSpline,
-			Speed:               car.Speed,
+			RouteID:              car.RouteID,
+			CurrentSplineID:      car.CurrentSplineID,
+			DestinationSplineID:  car.DestinationSplineID,
+			DistanceOnSpline:     car.DistanceOnSpline,
+			Speed:                car.Speed,
 			MaxSpeed:             car.MaxSpeed,
 			Accel:                car.Accel,
 			Length:               car.Length,
@@ -4870,9 +4938,10 @@ func saveSplineFile(splines []Spline, routes []Route, cars []Car, lights []Traff
 			}
 		}
 		saved.TrafficCycles = append(saved.TrafficCycles, SavedTrafficCycle{
-			ID:      c.ID,
-			Enabled: c.Enabled,
-			Phases:  phases,
+			ID:                 c.ID,
+			Enabled:            c.Enabled,
+			YellowDurationSecs: c.YellowDurationSecs,
+			Phases:             phases,
 		})
 	}
 
@@ -4936,21 +5005,21 @@ func loadSplineFile(path string) ([]Spline, []Route, []Car, []TrafficLight, []Tr
 	}
 	for _, entry := range saved.Cars {
 		car := Car{
-			RouteID:             entry.RouteID,
-			CurrentSplineID:     entry.CurrentSplineID,
-			DestinationSplineID: entry.DestinationSplineID,
-			PrevSplineIDs:       [2]int{-1, -1},
-			DistanceOnSpline:    entry.DistanceOnSpline,
-			Speed:               entry.Speed,
+			RouteID:              entry.RouteID,
+			CurrentSplineID:      entry.CurrentSplineID,
+			DestinationSplineID:  entry.DestinationSplineID,
+			PrevSplineIDs:        [2]int{-1, -1},
+			DistanceOnSpline:     entry.DistanceOnSpline,
+			Speed:                entry.Speed,
 			MaxSpeed:             entry.MaxSpeed,
 			Accel:                entry.Accel,
 			Length:               entry.Length,
 			Width:                entry.Width,
 			CurveSpeedMultiplier: entry.CurveSpeedMultiplier,
 			Color:                routeColorByID[entry.RouteID],
-			Braking:             false,
-			LaneChangeSplineID:  -1,
-			AfterSplineID:       -1,
+			Braking:              false,
+			LaneChangeSplineID:   -1,
+			AfterSplineID:        -1,
 
 			DesiredLaneSplineID: -1,
 			PreferenceCooldown:  rand.Float32() * preferenceChangeCooldownS,
@@ -4986,13 +5055,18 @@ func loadSplineFile(path string) ([]Spline, []Route, []Car, []TrafficLight, []Tr
 				GreenLightIDs: append([]int(nil), p.GreenLightIDs...),
 			}
 		}
+		yellowDur := entry.YellowDurationSecs
+		if yellowDur <= 0 {
+			yellowDur = 3.0
+		}
 		loadedCycles = append(loadedCycles, TrafficCycle{
-			ID:         entry.ID,
-			LightIDs:   nil, // not saved; rebuilt from lights
-			Phases:     phases,
-			Timer:      0,
-			PhaseIndex: 0,
-			Enabled:    entry.Enabled,
+			ID:                 entry.ID,
+			LightIDs:           nil, // not saved; rebuilt from lights
+			Phases:             phases,
+			Timer:              0,
+			PhaseIndex:         0,
+			Enabled:            entry.Enabled,
+			YellowDurationSecs: yellowDur,
 		})
 		if entry.ID > maxCycleID {
 			maxCycleID = entry.ID
