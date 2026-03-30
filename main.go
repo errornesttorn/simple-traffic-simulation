@@ -692,7 +692,7 @@ func main() {
 		allSplines := mergedSplines(splines, laneChangeSplines)
 		brakingDecisions, debugBlameLinks := computeBrakingDecisions(cars, allSplines, vehicleCounts)
 		followCaps := computeFollowingSpeedCaps(cars, allSplines, vehicleCounts)
-		cars = updateCars(cars, routes, allSplines, vehicleCounts, brakingDecisions, followCaps, dt)
+		cars = updateCars(cars, routes, allSplines, vehicleCounts, brakingDecisions, followCaps, trafficLights, trafficCycles, dt)
 		laneChangeSplines = gcLaneChangeSplines(laneChangeSplines, cars)
 		routes, cars = updateRouteSpawning(routes, cars, splines, dt)
 		trafficCycles = updateTrafficCycles(trafficCycles, dt)
@@ -3440,7 +3440,7 @@ func computeFollowingSpeedCaps(cars []Car, splines []Spline, vehicleCounts map[i
 	return caps
 }
 
-func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[int]int, brakingDecisions []bool, followCaps []float32, dt float32) []Car {
+func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[int]int, brakingDecisions []bool, followCaps []float32, lights []TrafficLight, cycles []TrafficCycle, dt float32) []Car {
 	if len(cars) == 0 {
 		return cars
 	}
@@ -3508,6 +3508,9 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 			}
 			if at := computeAnticipatoryTargetSpeed(car, currentSpline, splines, vehicleCounts); at < targetSpeed {
 				targetSpeed = at
+			}
+			if tl := computeTrafficLightSpeedCap(car, currentSpline, splines, lights, cycles, vehicleCounts); tl < targetSpeed {
+				targetSpeed = tl
 			}
 			// If a forced lane switch is pending, begin decelerating to
 			// laneChangeForcedSpeedMPS in time to reach the deadline position.
@@ -3981,6 +3984,96 @@ func lookupCurveSpeed(spline Spline, dist float32) float32 {
 		idx = len(spline.CurveSpeedMPS) - 1
 	}
 	return spline.CurveSpeedMPS[idx]
+}
+
+// trafficLightShouldStop returns true when the light is part of an enabled cycle
+// that is currently showing red or yellow — i.e. the car should try to stop.
+func trafficLightShouldStop(l TrafficLight, cycles []TrafficCycle) bool {
+	if l.CycleID < 0 {
+		return false
+	}
+	for _, c := range cycles {
+		if c.ID != l.CycleID {
+			continue
+		}
+		if !c.Enabled {
+			return false
+		}
+		state := trafficLightState(l.ID, l.CycleID, cycles)
+		return state == TrafficRed || state == TrafficYellow
+	}
+	return false
+}
+
+// computeTrafficLightSpeedCap looks ahead on the car's path and returns the
+// maximum speed the car should be doing now so it can decelerate to a stop at
+// each upcoming red/yellow light.  Uses the same kinematic formula as
+// computeAnticipatoryTargetSpeed (reqSpeed=0 case): allowed = sqrt(2·decel·d).
+// If physics genuinely can't stop the car in time (light just turned red very
+// close ahead) the car will still decelerate as hard as it can and coast
+// through — that is the natural "run the light" edge case.
+func computeTrafficLightSpeedCap(car Car, currentSpline Spline, splines []Spline,
+	lights []TrafficLight, cycles []TrafficCycle, vehicleCounts map[int]int) float32 {
+
+	decel := car.Accel * 1.5
+	result := float32(math.MaxFloat32)
+	remaining := currentSpline.Length - car.DistanceOnSpline
+
+	// Lookahead: stopping distance from current speed + small buffer, capped at 200 m.
+	lookahead := car.Speed*car.Speed/(2*decel) + 20
+	if lookahead > 200 {
+		lookahead = 200
+	}
+
+	checkLight := func(rawDistAhead float32) {
+		// DistanceOnSpline is measured from the car's centre, so subtract a
+		// full car length to make the front stop at least car.Length before
+		// the light position.
+		adj := rawDistAhead - car.Length
+		if adj <= 0 {
+			// Car centre is already within car.Length of the light — must stop
+			// immediately and stay stopped while the light is red.
+			result = 0
+			return
+		}
+		allowed := float32(math.Sqrt(float64(2 * decel * adj)))
+		if allowed < result {
+			result = allowed
+		}
+	}
+
+	for _, l := range lights {
+		if l.SplineID != currentSpline.ID {
+			continue
+		}
+		if l.DistOnSpline <= car.DistanceOnSpline {
+			continue // already passed
+		}
+		if !trafficLightShouldStop(l, cycles) {
+			continue
+		}
+		checkLight(l.DistOnSpline - car.DistanceOnSpline)
+	}
+
+	// Also check lights on the next spline if the lookahead extends past the end.
+	if remaining < lookahead {
+		nextID, ok := chooseNextSplineOnBestPath(splines, currentSpline.ID, car.DestinationSplineID, vehicleCounts)
+		if ok {
+			if _, ok2 := findSplineByID(splines, nextID); ok2 {
+				for _, l := range lights {
+					if l.SplineID != nextID {
+						continue
+					}
+					if !trafficLightShouldStop(l, cycles) {
+						continue
+					}
+					checkLight(remaining + l.DistOnSpline)
+				}
+			}
+		}
+	}
+
+	return result
 }
 
 // computeAnticipatoryTargetSpeed looks ahead along the car's path and returns
