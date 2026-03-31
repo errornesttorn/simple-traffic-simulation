@@ -257,6 +257,7 @@ type TrajectorySample struct {
 	Position rl.Vector2
 	Heading  rl.Vector2
 	Priority bool
+	SplineID int
 }
 
 type CollisionPrediction struct {
@@ -269,6 +270,8 @@ type CollisionPrediction struct {
 	HeadingB  rl.Vector2
 	PriorityA bool
 	PriorityB bool
+	SplineAID int
+	SplineBID int
 }
 
 type DebugBlameLink struct {
@@ -3198,7 +3201,7 @@ func computeBrakingDecisions(cars []Car, splines []Spline, vehicleCounts map[int
 			if !ok {
 				continue
 			}
-			blameI, blameJ := determineBlame(collision, cars[i], cars[j])
+			blameI, blameJ := determineBlame(collision, cars[i], cars[j], splines)
 			// Suppress blame if the blamed car recently left the other car's current spline —
 			// it has already cleared that segment and the other car is following behind.
 			if blameI && recentlyLeft(cars[i], cars[j].CurrentSplineID) {
@@ -3273,7 +3276,7 @@ func computeBrakingDecisions(cars []Car, splines []Spline, vehicleCounts map[int
 			if !ok {
 				continue
 			}
-			blameI, _ := determineBlame(collision, fasterCar, cars[j])
+			blameI, _ := determineBlame(collision, fasterCar, cars[j], splines)
 			if blameI && !recentlyLeft(fasterCar, cars[j].CurrentSplineID) {
 				// Suppress if the collision is unavoidable even when standing still —
 				// consistent with how braking blame is suppressed above.
@@ -3331,7 +3334,7 @@ func shouldBrakeForBlamedConflicts(carIndex int, cars []Car, splines []Spline, v
 		if len(testPrediction) == 0 {
 			return true
 		}
-		if hasBlamedConflictWithPrediction(carIndex, testCar, testPrediction, cars, predictions) {
+		if hasBlamedConflictWithPrediction(carIndex, testCar, testPrediction, cars, splines, predictions) {
 			return true
 		}
 	}
@@ -3339,7 +3342,7 @@ func shouldBrakeForBlamedConflicts(carIndex int, cars []Car, splines []Spline, v
 	return false
 }
 
-func hasBlamedConflictWithPrediction(carIndex int, testCar Car, testPrediction []TrajectorySample, cars []Car, predictions [][]TrajectorySample) bool {
+func hasBlamedConflictWithPrediction(carIndex int, testCar Car, testPrediction []TrajectorySample, cars []Car, splines []Spline, predictions [][]TrajectorySample) bool {
 	for otherIndex, otherCar := range cars {
 		if otherIndex == carIndex || otherIndex >= len(predictions) || len(predictions[otherIndex]) == 0 {
 			continue
@@ -3353,7 +3356,7 @@ func hasBlamedConflictWithPrediction(carIndex int, testCar Car, testPrediction [
 			continue
 		}
 
-		blameTestCar, _ := determineBlame(collision, testCar, otherCar)
+		blameTestCar, _ := determineBlame(collision, testCar, otherCar, splines)
 		if blameTestCar {
 			return true
 		}
@@ -3383,6 +3386,7 @@ func predictCarTrajectory(car Car, splines []Spline, vehicleCounts map[int]int, 
 			Position: pos,
 			Heading:  heading,
 			Priority: spline.Priority,
+			SplineID: spline.ID,
 		})
 
 		if !active {
@@ -3489,15 +3493,23 @@ func predictCollision(aSamples, bSamples []TrajectorySample, carA, carB Car) (Co
 			HeadingB:  hB,
 			PriorityA: aSamples[i].Priority,
 			PriorityB: bSamples[i].Priority,
+			SplineAID: aSamples[i].SplineID,
+			SplineBID: bSamples[i].SplineID,
 		}, true
 	}
 
 	return CollisionPrediction{}, false
 }
 
-func determineBlame(collision CollisionPrediction, carA, carB Car) (bool, bool) {
+func determineBlame(collision CollisionPrediction, carA, carB Car, splines []Spline) (bool, bool) {
 	if collision.PriorityA != collision.PriorityB {
 		if collision.PriorityA {
+			if normalCarOccupiesPriorityCollisionSpline(carB, collision.SplineAID, splines) {
+				return true, false
+			}
+			return false, true
+		}
+		if normalCarOccupiesPriorityCollisionSpline(carA, collision.SplineBID, splines) {
 			return false, true
 		}
 		return true, false
@@ -3571,6 +3583,38 @@ func blameLeftCar(collision CollisionPrediction, carA, carB Car) (bool, bool) {
 		return false, true
 	}
 	return true, false
+}
+
+func normalCarOccupiesPriorityCollisionSpline(car Car, prioritySplineID int, splines []Spline) bool {
+	if prioritySplineID < 0 {
+		return false
+	}
+	prioritySpline, ok := findSplineByID(splines, prioritySplineID)
+	if !ok || !prioritySpline.Priority {
+		return false
+	}
+	return carHitboxTouchesSpline(car, prioritySpline, splines)
+}
+
+func carHitboxTouchesSpline(car Car, targetSpline Spline, splines []Spline) bool {
+	currentSpline, ok := findSplineByID(splines, car.CurrentSplineID)
+	if !ok {
+		return false
+	}
+	pos, heading := sampleSplineAtDistance(currentSpline, car.DistanceOnSpline)
+	offset := circleOffset(car)
+	radius := collisionRadius(car)
+	radiusSq := radius * radius
+
+	front := vecAdd(pos, vecScale(heading, offset))
+	back := vecSub(pos, vecScale(heading, offset))
+
+	nearestFront := nearestSampleOnSpline(targetSpline, front)
+	if distSq(front, nearestFront) <= radiusSq {
+		return true
+	}
+	nearestBack := nearestSampleOnSpline(targetSpline, back)
+	return distSq(back, nearestBack) <= radiusSq
 }
 
 // computeFollowingSpeedCaps returns, for each car, the maximum speed it should
