@@ -234,6 +234,7 @@ type Car struct {
 	CurveSpeedMultiplier float32 // per-car multiplier on curvature speed limits (0.8–1.2)
 	Color                rl.Color
 	Braking              bool
+	SoftSlowing          bool // capped by a leading car's speed (follow-cap mechanism)
 
 	// Lane-change state.
 	LaneChanging       bool
@@ -1064,7 +1065,7 @@ func main() {
 			drawCutMode(stage, cutDraft, splines, mouseWorld, camera.Zoom)
 		}
 		allSplineIndexByID := buildSplineIndexByID(allSplines)
-		drawCars(cars, allSplines, allSplineIndexByID, camera.Zoom)
+		drawCars(cars, allSplines, allSplineIndexByID, camera.Zoom, debugMode)
 		if debugMode {
 			drawDebugBlameLinks(debugBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, rl.NewColor(220, 50, 50, 220))
 			drawDebugBlameLinks(holdBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, rl.NewColor(255, 165, 0, 220))
@@ -3623,6 +3624,7 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 		if i < len(followCaps) {
 			followCap = followCaps[i]
 		}
+		car.SoftSlowing = !shouldBrake && followCap < float32(math.MaxFloat32)
 
 		// Accumulate frustration time: only counts when a leader is present AND
 		// the car is at least 10 km/h below its preferred speed on this spline.
@@ -3773,7 +3775,7 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 	return alive
 }
 
-func drawCars(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom float32) {
+func drawCars(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom float32, debugMode bool) {
 	if len(cars) == 0 {
 		return
 	}
@@ -3789,6 +3791,8 @@ func drawCars(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom fl
 		rl.DrawRectanglePro(rect, origin, angle, car.Color)
 		if car.Braking {
 			rl.DrawCircleV(pos, maxf(car.Width*0.22, pixelsToWorld(zoom, 2)), rl.NewColor(220, 50, 50, 255))
+		} else if debugMode && car.SoftSlowing {
+			rl.DrawCircleV(pos, maxf(car.Width*0.22, pixelsToWorld(zoom, 2)), rl.NewColor(60, 120, 220, 255))
 		}
 	}
 }
