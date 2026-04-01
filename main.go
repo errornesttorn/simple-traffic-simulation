@@ -246,11 +246,16 @@ type Trailer struct {
 type Car struct {
 	RouteID int
 
-	CurrentSplineID      int
-	DestinationSplineID  int
-	PrevSplineIDs        [2]int // last two splines before current; -1 = none
-	DistanceOnSpline     float32 // arc-length of the car's FRONT on the current spline
-	RearPosition         rl.Vector2 // world-space position of the rear; pulled each tick
+	CurrentSplineID     int
+	DestinationSplineID int
+	PrevSplineIDs       [2]int     // last two splines before current; -1 = none
+	DistanceOnSpline    float32    // arc-length of the car's FRONT pivot on the current spline
+	RearPosition        rl.Vector2 // world-space position of the rear pivot; pulled each tick
+	// LateralOffset is the signed lateral displacement of the front pivot from the spline
+	// centre-line (positive = right of travel). It is smoothly driven toward a target
+	// value derived from local curvature so that the car body stays centred over the
+	// road instead of drifting to the inside on bends.
+	LateralOffset        float32
 	Speed                float32
 	MaxSpeed             float32
 	Accel                float32
@@ -3373,7 +3378,7 @@ func spawnCar(route Route, splines []Spline) Car {
 	// Speed range: ~50-130 km/h = 13.9-36.1 m/s.
 	// Acceleration: 2.5-4.5 m/s² (comfortable urban driving).
 	length := randRange(4.0, 4.8) / metersPerUnit
-	if rand.Float32() < 0.05 {
+	if rand.Float32() < 0.10 {
 		length *= 2
 	}
 	car := Car{
@@ -3662,7 +3667,18 @@ func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []Tr
 		if !ok {
 			break
 		}
-		frontPos, splineTangent := sampleSplineAtDistance(spline, simCar.DistanceOnSpline)
+		splinePos, splineTangent := sampleSplineAtDistance(spline, simCar.DistanceOnSpline)
+		// Advance lateral offset toward curvature-compensation target.
+		κ := signedCurvatureAtArcLen(&spline, simCar.DistanceOnSpline)
+		wb := simCar.Length * wheelbaseFrac
+		targetOffset := κ * wb * wb / 4
+		if simCar.Trailer.HasTrailer {
+			targetOffset = κ * wb * wb / 2
+		}
+		lerpRate := speed / (wb + 0.01)
+		simCar.LateralOffset += (targetOffset - simCar.LateralOffset) * clampf(lerpRate*step, 0, 1)
+		rightNormal := rl.Vector2{X: splineTangent.Y, Y: -splineTangent.X}
+		frontPos := vecAdd(splinePos, vecScale(rightNormal, simCar.LateralOffset))
 		// Pull simulated rear pivot toward front pivot maintaining wheelbase length.
 		rearToFront := vecSub(frontPos, simRearPos)
 		if vectorLengthSq(rearToFront) > 1e-9 {
@@ -3965,7 +3981,9 @@ func carHitboxTouchesSpline(car Car, targetSpline Spline, splines []Spline) bool
 	if !ok {
 		return false
 	}
-	frontPos, splineTangent := sampleSplineAtDistance(currentSpline, car.DistanceOnSpline)
+	splinePos3, splineTangent := sampleSplineAtDistance(currentSpline, car.DistanceOnSpline)
+	rightNormal3 := rl.Vector2{X: splineTangent.Y, Y: -splineTangent.X}
+	frontPos := vecAdd(splinePos3, vecScale(rightNormal3, car.LateralOffset))
 	bodyHeading := normalize(vecSub(frontPos, car.RearPosition))
 	if vectorLengthSq(vecSub(frontPos, car.RearPosition)) <= 1e-9 {
 		bodyHeading = splineTangent
@@ -4213,8 +4231,22 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 
 			car.DistanceOnSpline += car.Speed * dt
 			if car.DistanceOnSpline <= currentSpline.Length {
-				// Pull cab rear pivot toward front pivot, maintaining wheelbase length.
-				frontPos, _ := sampleSplineAtDistance(currentSpline, car.DistanceOnSpline)
+				// Drive lateral offset toward the curvature-compensation target.
+				// Target = κ·W²/2 (right of travel when curving left), so the body
+				// centre stays over the spline as the rear cuts the inside of the bend.
+				κ := signedCurvatureAtArcLen(&currentSpline, car.DistanceOnSpline)
+				wb := car.Length * wheelbaseFrac
+				targetOffset := κ * wb * wb / 4
+				if car.Trailer.HasTrailer {
+					targetOffset = κ * wb * wb / 2
+				}
+				lerpRate := car.Speed / (wb + 0.01) // converge in ~wheelbase/speed s; zero at standstill
+				car.LateralOffset += (targetOffset - car.LateralOffset) * clampf(lerpRate*dt, 0, 1)
+
+				// Pull cab rear pivot toward the offset front pivot.
+				splinePos, tangent := sampleSplineAtDistance(currentSpline, car.DistanceOnSpline)
+				rightNormal := rl.Vector2{X: tangent.Y, Y: -tangent.X}
+				frontPos := vecAdd(splinePos, vecScale(rightNormal, car.LateralOffset))
 				rearToFront := vecSub(frontPos, car.RearPosition)
 				if vectorLengthSq(rearToFront) > 1e-9 {
 					car.RearPosition = vecSub(frontPos, vecScale(normalize(rearToFront), car.Length*wheelbaseFrac))
@@ -4291,7 +4323,9 @@ func drawCars(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom fl
 		if !ok {
 			continue
 		}
-		frontPos, splineTangent := sampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
+		splinePos, splineTangent := sampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
+		rightNormal := rl.Vector2{X: splineTangent.Y, Y: -splineTangent.X}
+		frontPos := vecAdd(splinePos, vecScale(rightNormal, car.LateralOffset))
 		bodyHeading := normalize(vecSub(frontPos, car.RearPosition))
 		if vectorLengthSq(vecSub(frontPos, car.RearPosition)) <= 1e-9 {
 			bodyHeading = splineTangent
@@ -4332,7 +4366,9 @@ func drawCarHitboxes(cars []Car, splines []Spline, splineIndexByID map[int]int) 
 		if !ok {
 			continue
 		}
-		frontPos, splineTangent := sampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
+		splinePos2, splineTangent := sampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
+		rightNormal2 := rl.Vector2{X: splineTangent.Y, Y: -splineTangent.X}
+		frontPos := vecAdd(splinePos2, vecScale(rightNormal2, car.LateralOffset))
 		bodyHeading := normalize(vecSub(frontPos, car.RearPosition))
 		if vectorLengthSq(vecSub(frontPos, car.RearPosition)) <= 1e-9 {
 			bodyHeading = splineTangent
@@ -4798,6 +4834,34 @@ func curveSpeedAtArcLen(s *Spline, d float32) float32 {
 		return maxCarSpeed
 	}
 	return v
+}
+
+// signedCurvatureAtArcLen returns the signed curvature (1/radius) at arc-length d.
+// Positive = turning left (CCW), negative = turning right (CW).
+// Uses the same three-sample circumradius approach as curveSpeedAtArcLen.
+func signedCurvatureAtArcLen(s *Spline, d float32) float32 {
+	idx := 0
+	for idx < simSamples && s.CumLen[idx+1] < d {
+		idx++
+	}
+	i0, i1, i2 := idx-1, idx, idx+1
+	if i0 < 0 {
+		i0, i1, i2 = 0, 1, 2
+	}
+	if i2 > simSamples {
+		i0, i1, i2 = simSamples-2, simSamples-1, simSamples
+	}
+	A, B, C := s.Samples[i0], s.Samples[i1], s.Samples[i2]
+	ab := float32(math.Sqrt(float64(distSq(A, B))))
+	bc := float32(math.Sqrt(float64(distSq(B, C))))
+	ca := float32(math.Sqrt(float64(distSq(C, A))))
+	denom := ab * bc * ca
+	if denom < 1e-6 {
+		return 0
+	}
+	// Signed cross(AB, AC): positive = CCW (left turn).
+	cross := (B.X-A.X)*(C.Y-A.Y) - (B.Y-A.Y)*(C.X-A.X)
+	return 2 * cross / denom
 }
 
 // lookupCurveSpeed returns the precomputed curvature speed limit at the given
@@ -5969,7 +6033,7 @@ func hitboxCircleOffsets(length, width float32) []float32 {
 	return offsets
 }
 
-func collisionRadius(car Car) float32        { return hitboxRadius(car.Width) }
+func collisionRadius(car Car) float32          { return hitboxRadius(car.Width) }
 func collisionCircleOffsets(car Car) []float32 { return hitboxCircleOffsets(car.Length, car.Width) }
 
 func headingAngleDegrees(a, b rl.Vector2) float32 {
