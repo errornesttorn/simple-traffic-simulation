@@ -140,6 +140,14 @@ const (
 	curveSpeedIntervalM       float32 = 10.0       // arc-length spacing of curvature speed samples (m)
 	maxLateralAccelMPS2       float32 = 5.0        // max lateral acceleration for curve speed (m/s²)
 	collisionBroadPhaseSlackM float32 = 5.0
+
+	// Pivot fractions: the spline-following point sits 20% from the front and
+	// the dragged rear pivot sits 80% from the front (20% from the rear).
+	// This models axle positions rather than bumpers, giving realistic turning.
+	frontPivotFrac float32 = 0.20 // fraction of length from front bumper to front pivot
+	rearPivotFrac  float32 = 0.80 // fraction of length from front bumper to rear pivot
+	// Wheelbase = distance between the two pivots as a fraction of car length.
+	wheelbaseFrac float32 = rearPivotFrac - frontPivotFrac // 0.60
 )
 
 type Spline struct {
@@ -230,7 +238,8 @@ type Car struct {
 	CurrentSplineID      int
 	DestinationSplineID  int
 	PrevSplineIDs        [2]int // last two splines before current; -1 = none
-	DistanceOnSpline     float32
+	DistanceOnSpline     float32 // arc-length of the car's FRONT on the current spline
+	RearPosition         rl.Vector2 // world-space position of the rear; pulled each tick
 	Speed                float32
 	MaxSpeed             float32
 	Accel                float32
@@ -529,23 +538,25 @@ var uiFont rl.Font
 
 // toolbarItem describes one button in the mode toolbar.
 type toolbarItem struct {
-	key   string
-	label string
-	mode  EditorMode
-	isDbg bool // true for the debug toggle button
+	key      string
+	label    string
+	mode     EditorMode
+	isDbg    bool // true for the debug toggle button
+	isHitbox bool // true for the hitbox debug toggle button
 }
 
 // toolbarItems is the ordered list of toolbar buttons.
 var toolbarItems = []toolbarItem{
-	{"E", "Edit", ModeEdit, false},
-	{"R", "Route", ModeRoute, false},
-	{"P", "Priority", ModePriority, false},
-	{"L", "Couple", ModeCouple, false},
-	{"C", "Cut", ModeCut, false},
-	{"S", "Speed", ModeSpeedLimit, false},
-	{"V", "Prefer", ModePreference, false},
-	{"T", "Traffic", ModeTrafficLight, false},
-	{"D", "Debug", 0, true},
+	{"E", "Edit", ModeEdit, false, false},
+	{"R", "Route", ModeRoute, false, false},
+	{"P", "Priority", ModePriority, false, false},
+	{"L", "Couple", ModeCouple, false, false},
+	{"C", "Cut", ModeCut, false, false},
+	{"S", "Speed", ModeSpeedLimit, false, false},
+	{"V", "Prefer", ModePreference, false, false},
+	{"T", "Traffic", ModeTrafficLight, false, false},
+	{"D", "Debug", 0, true, false},
+	{"H", "Hitbox", 0, false, true},
 }
 
 const (
@@ -611,6 +622,7 @@ func main() {
 	routeStartSplineID := -1
 	coupleModeFirstID := -1
 	debugMode := false
+	hitboxDebugMode := false
 	profileMode := false
 	prof := profiler{}
 	selectedSpeedKmh := 50
@@ -750,6 +762,9 @@ func main() {
 		if rl.IsKeyPressed(rl.KeyD) {
 			debugMode = !debugMode
 		}
+		if rl.IsKeyPressed(rl.KeyH) {
+			hitboxDebugMode = !hitboxDebugMode
+		}
 		if rl.IsKeyPressed(rl.KeyF3) {
 			profileMode = !profileMode
 		}
@@ -829,6 +844,8 @@ func main() {
 				if rl.CheckCollisionPointRec(mouseScreen, toolbarBtnRect(i)) {
 					if item.isDbg {
 						debugMode = !debugMode
+					} else if item.isHitbox {
+						hitboxDebugMode = !hitboxDebugMode
 					} else {
 						mode = item.mode
 						stage = StageIdle
@@ -1244,6 +1261,9 @@ func main() {
 		}
 		allSplineIndexByID := buildSplineIndexByID(allSplines)
 		drawCars(cars, allSplines, allSplineIndexByID, camera.Zoom, debugMode)
+		if hitboxDebugMode {
+			drawCarHitboxes(cars, allSplines, allSplineIndexByID)
+		}
 		if debugMode {
 			drawDebugBlameLinks(debugBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, rl.NewColor(220, 50, 50, 220))
 			drawDebugBlameLinks(holdBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, rl.NewColor(255, 165, 0, 220))
@@ -1276,7 +1296,7 @@ func main() {
 		if mode == ModePreference {
 			drawPreferenceLabels(splines, camera)
 		}
-		drawHud(mode, stage, draft, hoveredSpline, routeStartSplineID, coupleModeFirstID, debugMode, camera.Zoom, len(splines), len(routes), len(cars))
+		drawHud(mode, stage, draft, hoveredSpline, routeStartSplineID, coupleModeFirstID, debugMode, hitboxDebugMode, camera.Zoom, len(splines), len(routes), len(cars))
 		if profileMode {
 			drawProfilerOverlay(prof)
 		}
@@ -2464,19 +2484,20 @@ func isLaneChangeLandingSafe(p3Dist float32, destSplineID int, switchingCar Car,
 		if other.CurrentSplineID != destSplineID {
 			continue
 		}
-		halfLengths := (switchingCar.Length + other.Length) / 2
-		// Predict where each car will be when the merge completes.
-		// Switching car lands at p3Dist. Other car travels other.Speed*T further.
-		otherPosAtLanding := other.DistanceOnSpline + other.Speed*T
-		gapAtLanding := (otherPosAtLanding - p3Dist) // positive = other is ahead, negative = behind
+		// Predict where each car's front will be when the merge completes.
+		// DistanceOnSpline is now the front position on the spline.
+		otherFrontAtLanding := other.DistanceOnSpline + other.Speed*T
+		gapAtLanding := otherFrontAtLanding - p3Dist // positive = other front is ahead of our landing front
 		if gapAtLanding >= 0 {
-			// Other car will be ahead at landing — bumper gap must be positive.
-			if gapAtLanding < halfLengths+safetyMargin {
+			// Other car will be ahead — gap from our front to their rear must be safe.
+			// bumper gap = gapAtLanding - other.Length
+			if gapAtLanding < other.Length+safetyMargin {
 				return false
 			}
 		} else {
-			// Other car will be behind at landing — switching car rear must clear its front.
-			if -gapAtLanding < halfLengths+safetyMargin {
+			// Other car will be behind — gap from their front to our rear must be safe.
+			// bumper gap = -gapAtLanding - switchingCar.Length
+			if -gapAtLanding < switchingCar.Length+safetyMargin {
 				return false
 			}
 		}
@@ -3277,7 +3298,7 @@ func updateRouteSpawning(routes []Route, cars []Car, splines []Spline, dt float3
 		if routes[i].NextSpawnIn > 0 {
 			continue
 		}
-		candidate := spawnCar(routes[i])
+		candidate := spawnCar(routes[i], splines)
 		if !spawnBlocked(candidate, cars, splines) {
 			cars = append(cars, candidate)
 			routes[i].NextSpawnIn = randomizedSpawnDelay(routes[i].SpawnPerMinute)
@@ -3294,7 +3315,9 @@ func spawnBlocked(candidate Car, cars []Car, splines []Spline) bool {
 	if !ok {
 		return false
 	}
-	pos, heading := sampleSplineAtDistance(spline, 0)
+	frontPos, _ := sampleSplineAtDistance(spline, 0)
+	cCenter := vecScale(vecAdd(frontPos, candidate.RearPosition), 0.5)
+	cHeading := normalize(vecSub(frontPos, candidate.RearPosition))
 	rC := collisionRadius(candidate)
 	candidateOffsets := collisionCircleOffsets(candidate)
 
@@ -3306,16 +3329,18 @@ func spawnBlocked(candidate Car, cars []Car, splines []Spline) bool {
 		if !ok {
 			continue
 		}
-		oPos, oHeading := sampleSplineAtDistance(otherSpline, other.DistanceOnSpline)
+		otherFront, _ := sampleSplineAtDistance(otherSpline, other.DistanceOnSpline)
+		oCenter := vecScale(vecAdd(otherFront, other.RearPosition), 0.5)
+		oHeading := normalize(vecSub(otherFront, other.RearPosition))
 		rO := collisionRadius(other)
 		thresh := rC + rO
 		threshSq := thresh * thresh
 		otherOffsets := collisionCircleOffsets(other)
 
 		for _, offC := range candidateOffsets {
-			cCircle := vecAdd(pos, vecScale(heading, offC))
+			cCircle := vecAdd(cCenter, vecScale(cHeading, offC))
 			for _, offO := range otherOffsets {
-				oCircle := vecAdd(oPos, vecScale(oHeading, offO))
+				oCircle := vecAdd(oCenter, vecScale(oHeading, offO))
 				if distSq(cCircle, oCircle) <= threshSq {
 					return true
 				}
@@ -3325,7 +3350,7 @@ func spawnBlocked(candidate Car, cars []Car, splines []Spline) bool {
 	return false
 }
 
-func spawnCar(route Route) Car {
+func spawnCar(route Route, splines []Spline) Car {
 	// All values in SI units: metres, m/s, m/s².
 	// Typical passenger car: 4.0-4.8 m long, 1.8-2.0 m wide.
 	// Speed range: ~50-130 km/h = 13.9-36.1 m/s.
@@ -3334,7 +3359,7 @@ func spawnCar(route Route) Car {
 	if rand.Float32() < 0.05 {
 		length *= 2
 	}
-	return Car{
+	car := Car{
 		RouteID:              route.ID,
 		CurrentSplineID:      route.StartSplineID,
 		DestinationSplineID:  route.EndSplineID,
@@ -3355,6 +3380,12 @@ func spawnCar(route Route) Car {
 		PreferenceCooldown:  rand.Float32() * preferenceChangeCooldownS,
 		OvertakeCooldown:    rand.Float32() * overtakeCooldownS,
 	}
+	// Initialise rear pivot behind the front pivot along the spawn spline tangent.
+	if spline, ok := findSplineByID(splines, route.StartSplineID); ok {
+		frontPos, tangent := sampleSplineAtDistance(spline, 0)
+		car.RearPosition = vecSub(frontPos, vecScale(tangent, car.Length*wheelbaseFrac))
+	}
+	return car
 }
 
 // recentlyLeft returns true if the car was on splineID within its last two transitions.
@@ -3584,6 +3615,7 @@ func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []Tr
 	steps := int(math.Ceil(float64(horizon / step)))
 	samples := make([]TrajectorySample, 0, steps+1)
 	simCar := car
+	simRearPos := car.RearPosition
 	speed := maxf(car.Speed, 0)
 	active := true
 
@@ -3592,11 +3624,20 @@ func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []Tr
 		if !ok {
 			break
 		}
-		pos, heading := sampleSplineAtDistance(spline, simCar.DistanceOnSpline)
+		frontPos, splineTangent := sampleSplineAtDistance(spline, simCar.DistanceOnSpline)
+		// Pull simulated rear pivot toward front pivot maintaining wheelbase length.
+		rearToFront := vecSub(frontPos, simRearPos)
+		if vectorLengthSq(rearToFront) > 1e-9 {
+			simRearPos = vecSub(frontPos, vecScale(normalize(rearToFront), simCar.Length*wheelbaseFrac))
+		} else {
+			simRearPos = vecSub(frontPos, vecScale(splineTangent, simCar.Length*wheelbaseFrac))
+		}
+		center := vecScale(vecAdd(frontPos, simRearPos), 0.5)
+		bodyHeading := normalize(vecSub(frontPos, simRearPos))
 		samples = append(samples, TrajectorySample{
 			Time:     float32(stepIndex) * step,
-			Position: pos,
-			Heading:  heading,
+			Position: center,
+			Heading:  bodyHeading,
 			Priority: spline.Priority,
 			SplineID: spline.ID,
 		})
@@ -3836,11 +3877,16 @@ func carHitboxTouchesSpline(car Car, targetSpline Spline, splines []Spline) bool
 	if !ok {
 		return false
 	}
-	pos, heading := sampleSplineAtDistance(currentSpline, car.DistanceOnSpline)
+	frontPos, splineTangent := sampleSplineAtDistance(currentSpline, car.DistanceOnSpline)
+	bodyHeading := normalize(vecSub(frontPos, car.RearPosition))
+	if vectorLengthSq(vecSub(frontPos, car.RearPosition)) <= 1e-9 {
+		bodyHeading = splineTangent
+	}
+	center := vecScale(vecAdd(frontPos, car.RearPosition), 0.5)
 	radius := collisionRadius(car)
 	radiusSq := radius * radius
 	for _, offset := range collisionCircleOffsets(car) {
-		circle := vecAdd(pos, vecScale(heading, offset))
+		circle := vecAdd(center, vecScale(bodyHeading, offset))
 		nearest := nearestSampleOnSpline(targetSpline, circle)
 		if distSq(circle, nearest) <= radiusSq {
 			return true
@@ -3935,8 +3981,9 @@ func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) []float32 {
 			if euclidean > followLookaheadM {
 				continue
 			}
-			// Gap = euclidean distance minus half-lengths of both cars.
-			gap := euclidean - car.Length/2 - other.Length/2
+			// Gap = distance from my front to the leader's rear.
+			rearDiff := vecSub(other.RearPosition, pI)
+			gap := float32(math.Sqrt(float64(rearDiff.X*rearDiff.X + rearDiff.Y*rearDiff.Y)))
 			if gap > desiredGap {
 				continue
 			}
@@ -4073,6 +4120,12 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 
 			car.DistanceOnSpline += car.Speed * dt
 			if car.DistanceOnSpline <= currentSpline.Length {
+				// Pull rear pivot toward front pivot, maintaining wheelbase length.
+				frontPos, _ := sampleSplineAtDistance(currentSpline, car.DistanceOnSpline)
+				rearToFront := vecSub(frontPos, car.RearPosition)
+				if vectorLengthSq(rearToFront) > 1e-9 {
+					car.RearPosition = vecSub(frontPos, vecScale(normalize(rearToFront), car.Length*wheelbaseFrac))
+				}
 				alive = append(alive, car)
 				break
 			}
@@ -4137,16 +4190,49 @@ func drawCars(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom fl
 		if !ok {
 			continue
 		}
-		pos, tangent := sampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
-		angle := float32(math.Atan2(float64(tangent.Y), float64(tangent.X)) * 180 / math.Pi)
-		rect := rl.NewRectangle(pos.X, pos.Y, car.Length, car.Width)
+		frontPos, splineTangent := sampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
+		bodyHeading := normalize(vecSub(frontPos, car.RearPosition))
+		if vectorLengthSq(vecSub(frontPos, car.RearPosition)) <= 1e-9 {
+			bodyHeading = splineTangent
+		}
+		center := vecScale(vecAdd(frontPos, car.RearPosition), 0.5)
+		angle := float32(math.Atan2(float64(bodyHeading.Y), float64(bodyHeading.X)) * 180 / math.Pi)
+		rect := rl.NewRectangle(center.X, center.Y, car.Length, car.Width)
 		origin := rl.NewVector2(car.Length/2, car.Width/2)
 		rl.DrawRectanglePro(rect, origin, angle, car.Color)
 		if car.Braking {
-			rl.DrawCircleV(pos, maxf(car.Width*0.22, pixelsToWorld(zoom, 2)), rl.NewColor(220, 50, 50, 255))
+			rl.DrawCircleV(center, maxf(car.Width*0.22, pixelsToWorld(zoom, 2)), rl.NewColor(220, 50, 50, 255))
 		} else if debugMode && car.SoftSlowing {
-			rl.DrawCircleV(pos, maxf(car.Width*0.22, pixelsToWorld(zoom, 2)), rl.NewColor(60, 120, 220, 255))
+			rl.DrawCircleV(center, maxf(car.Width*0.22, pixelsToWorld(zoom, 2)), rl.NewColor(60, 120, 220, 255))
 		}
+	}
+}
+
+// drawCarHitboxes renders the multi-circle collision hitbox of every car.
+func drawCarHitboxes(cars []Car, splines []Spline, splineIndexByID map[int]int) {
+	fill := rl.NewColor(255, 80, 255, 50)
+	outline := rl.NewColor(255, 80, 255, 200)
+	pivotColor := rl.NewColor(255, 220, 0, 220)
+	for _, car := range cars {
+		splineIdx, ok := splineIndexByID[car.CurrentSplineID]
+		if !ok {
+			continue
+		}
+		frontPos, splineTangent := sampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
+		bodyHeading := normalize(vecSub(frontPos, car.RearPosition))
+		if vectorLengthSq(vecSub(frontPos, car.RearPosition)) <= 1e-9 {
+			bodyHeading = splineTangent
+		}
+		center := vecScale(vecAdd(frontPos, car.RearPosition), 0.5)
+		r := collisionRadius(car)
+		for _, offset := range collisionCircleOffsets(car) {
+			circlePos := vecAdd(center, vecScale(bodyHeading, offset))
+			rl.DrawCircleV(circlePos, r, fill)
+			rl.DrawCircleLinesV(circlePos, r, outline)
+		}
+		// Mark front and rear pivots.
+		rl.DrawCircleV(frontPos, r*0.25, pivotColor)
+		rl.DrawCircleV(car.RearPosition, r*0.25, pivotColor)
 	}
 }
 
@@ -4159,8 +4245,9 @@ func drawCarSpeedLabels(cars []Car, splines []Spline, splineIndexByID map[int]in
 		if !ok {
 			continue
 		}
-		pos, _ := sampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
-		screen := rl.GetWorldToScreen2D(pos, camera)
+		frontPos, _ := sampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
+		center := vecScale(vecAdd(frontPos, car.RearPosition), 0.5)
+		screen := rl.GetWorldToScreen2D(center, camera)
 		label := fmt.Sprintf("%d", int(car.Speed*3.6))
 		textW := measureText(label, fontSize)
 		drawText(label, int32(screen.X)-textW/2, int32(screen.Y)-18, fontSize, rl.Black)
@@ -4185,8 +4272,10 @@ func drawDebugBlameLinks(links []DebugBlameLink, cars []Car, splines []Spline, s
 			continue
 		}
 
-		fromPos, _ := sampleSplineAtDistance(splines[fromSplineIdx], cars[link.FromCarIndex].DistanceOnSpline)
-		toPos, _ := sampleSplineAtDistance(splines[toSplineIdx], cars[link.ToCarIndex].DistanceOnSpline)
+		fromFront, _ := sampleSplineAtDistance(splines[fromSplineIdx], cars[link.FromCarIndex].DistanceOnSpline)
+		toFront, _ := sampleSplineAtDistance(splines[toSplineIdx], cars[link.ToCarIndex].DistanceOnSpline)
+		fromPos := vecScale(vecAdd(fromFront, cars[link.FromCarIndex].RearPosition), 0.5)
+		toPos := vecScale(vecAdd(toFront, cars[link.ToCarIndex].RearPosition), 0.5)
 		rl.DrawLineEx(fromPos, toPos, lineThickness, lineColor)
 		rl.DrawCircleV(fromPos, pixelsToWorld(zoom, 3.5), lineColor)
 	}
@@ -4349,7 +4438,7 @@ func modeStatusText(mode EditorMode, stage Stage, draft Draft, routeStartSplineI
 	return ""
 }
 
-func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, routeStartSplineID int, coupleModeFirstID int, debugMode bool, zoom float32, splineCount, routeCount, carCount int) {
+func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, routeStartSplineID int, coupleModeFirstID int, debugMode bool, hitboxDebugMode bool, zoom float32, splineCount, routeCount, carCount int) {
 	mouse := rl.GetMousePosition()
 
 	bgNormal := rl.NewColor(245, 245, 248, 245)
@@ -4362,7 +4451,7 @@ func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, route
 
 	for i, item := range toolbarItems {
 		r := toolbarBtnRect(i)
-		isActive := (!item.isDbg && item.mode == mode) || (item.isDbg && debugMode)
+		isActive := (!item.isDbg && !item.isHitbox && item.mode == mode) || (item.isDbg && debugMode) || (item.isHitbox && hitboxDebugMode)
 		isHovered := rl.CheckCollisionPointRec(mouse, r)
 
 		bg, out, fg := bgNormal, outNormal, txtDark
@@ -5725,15 +5814,18 @@ func collisionRadius(car Car) float32 {
 }
 
 // collisionCircleOffsets returns circle-centre offsets along the car's heading.
-// There are always at least two circles, and more are inserted whenever the
-// spacing between neighbouring centres would otherwise exceed 2 m.
+// Circles are placed from front to rear so that adjacent circle edges have a
+// gap of at most 1 m (they never overlap). The minimum is two circles.
 func collisionCircleOffsets(car Car) []float32 {
-	span := 2 * (car.Length/2 + 1.0 - collisionRadius(car))
+	r := collisionRadius(car)
+	span := 2 * (car.Length/2 + 1.0 - r)
 	if span < 0 {
 		span = 0
 	}
 
-	count := int(math.Ceil(float64(span/2.0))) + 1
+	// Maximum centre-to-centre distance that keeps the edge gap ≤ 1 m.
+	maxSpacing := 2*r + 1.0
+	count := int(math.Ceil(float64(span/maxSpacing))) + 1
 	if count < 2 {
 		count = 2
 	}
