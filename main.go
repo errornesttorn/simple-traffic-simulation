@@ -2817,8 +2817,13 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 		car.PreferenceCooldown -= dt
 		if car.PreferenceCooldown <= 0 {
 			car.PreferenceCooldown = preferenceChangeCooldownS
+			_, curPrefTime, curPrefTimeOk := findShortestPathWeightedWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID)
 			for _, destID := range findBetterPreferenceLaneCandidates(*car, splines, splineIndexByID) {
-				if _, _, pathOk := findShortestPathWeightedWithGraph(graph, destID, car.DestinationSplineID); !pathOk {
+				_, destTime, pathOk := findShortestPathWeightedWithGraph(graph, destID, car.DestinationSplineID)
+				if !pathOk {
+					continue
+				}
+				if curPrefTimeOk && destTime-curPrefTime > 20.0 {
 					continue
 				}
 				srcIdx, srcOk := splineIndexByID[car.CurrentSplineID]
@@ -2847,8 +2852,13 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 		if car.SlowedTimer > overtakeSlowThresholdS && car.OvertakeCooldown <= 0 &&
 			(!leaderFound || leaderSpeed <= car.Speed) {
 			car.OvertakeCooldown = overtakeCooldownS
+			_, curOvertakeTime, curOvertakeTimeOk := findShortestPathWeightedWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID)
 			for _, destID := range findOvertakeLaneCandidates(*car, splines, splineIndexByID) {
-				if _, _, pathOk := findShortestPathWeightedWithGraph(graph, destID, car.DestinationSplineID); !pathOk {
+				_, destTime, pathOk := findShortestPathWeightedWithGraph(graph, destID, car.DestinationSplineID)
+				if !pathOk {
+					continue
+				}
+				if curOvertakeTimeOk && destTime-curOvertakeTime > 20.0 {
 					continue
 				}
 				srcIdx, srcOk := splineIndexByID[car.CurrentSplineID]
@@ -3378,8 +3388,10 @@ func spawnCar(route Route, splines []Spline) Car {
 	// Speed range: ~80-130 km/h = 22.2-36.1 m/s.
 	// Acceleration: 2.5-4.5 m/s² (comfortable urban driving).
 	length := randRange(4.0, 4.8) / metersPerUnit
+	width := randRange(1.8, 2.0) / metersPerUnit
 	if rand.Float32() < 0.25 {
 		length *= 2
+		width += 0.6
 	}
 	car := Car{
 		RouteID:              route.ID,
@@ -3391,7 +3403,7 @@ func spawnCar(route Route, splines []Spline) Car {
 		MaxSpeed:             randRange(22.2, 36.1), // m/s — 80–130 km/h
 		Accel:                randRange(2.5, 4.5),   // m/s²
 		Length:               length,
-		Width:                randRange(1.8, 2.0) / metersPerUnit, // world units
+		Width:                width,
 		CurveSpeedMultiplier: randRange(0.8, 1.2),
 		Color:                route.Color,
 		Braking:              false,
@@ -4311,6 +4323,26 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 			car.PrevSplineIDs[1] = car.PrevSplineIDs[0]
 			car.PrevSplineIDs[0] = car.CurrentSplineID
 			car.CurrentSplineID = nextSplineID
+
+			// Opportunistic lane change: check whether a hard-coupled parallel lane
+			// offers a significantly faster route to the destination.  If so, treat it
+			// as a desired lane so the last-resort mechanism will switch into it.
+			// Only runs when no forced-switch is already pending.
+			if car.DesiredLaneSplineID < 0 && car.CurrentSplineID != car.DestinationSplineID {
+				if newSpline, scOk := graph.splineByID(car.CurrentSplineID); scOk && len(newSpline.HardCoupledIDs) > 0 {
+					_, curTime, curOk := findShortestPathWeightedWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID)
+					if curOk {
+						for _, cid := range newSpline.HardCoupledIDs {
+							_, coupledTime, coupledOk := findShortestPathWeightedWithGraph(graph, cid, car.DestinationSplineID)
+							if coupledOk && curTime-coupledTime >= 20.0 {
+								car.DesiredLaneSplineID = cid
+								car.DesiredLaneDeadline = maxf(newSpline.Length-laneChangeForcedDistEnd, 0)
+								break
+							}
+						}
+					}
+				}
+			}
 		}
 	}
 	return alive
