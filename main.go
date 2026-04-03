@@ -3792,7 +3792,7 @@ func spawnVehicle(route Route, splines []Spline) Car {
 	accel := randRange(2.5, 4.5)
 	curveSpeedMultiplier := randRange(0.8, 1.2)
 	if route.VehicleKind == VehicleBus {
-		length = randRange(11.5, 15.0) / metersPerUnit
+		length = randRange(9.5, 13.0) / metersPerUnit
 		width = randRange(2.45, 2.65) / metersPerUnit
 		maxSpeed = randRange(13.9, 20.0)
 		accel = randRange(1.2, 2.0)
@@ -4032,51 +4032,6 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph) ([]bool, []bool, []De
 		}
 	}
 
-	// Deadlock detection: break blame cycles of up to 4 hops by releasing
-	// the car with the smallest index in each cycle.
-	{
-		yieldTo := make([]int, len(cars))
-		for k := range yieldTo {
-			yieldTo[k] = -1
-		}
-		for _, link := range tentativeLinks {
-			if yieldTo[link.FromCarIndex] == -1 {
-				yieldTo[link.FromCarIndex] = link.ToCarIndex
-			}
-		}
-		for i := range cars {
-			if yieldTo[i] < 0 || !initialBlame[i] {
-				continue
-			}
-			var chain [4]int
-			chainLen := 0
-			cur := i
-			cycleFound := false
-			for hop := 0; hop < 4; hop++ {
-				chain[hop] = cur
-				chainLen = hop + 1
-				next := yieldTo[cur]
-				if next < 0 {
-					break
-				}
-				if next == i {
-					cycleFound = true
-					break
-				}
-				cur = next
-			}
-			if cycleFound {
-				minIdx := chain[0]
-				for k := 1; k < chainLen; k++ {
-					if chain[k] < minIdx {
-						minIdx = chain[k]
-					}
-				}
-				initialBlame[minIdx] = false
-			}
-		}
-	}
-
 	for i := range cars {
 		if !initialBlame[i] {
 			continue
@@ -4137,14 +4092,32 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph) ([]bool, []bool, []De
 		}
 	}
 
+	// Deadlock detection: break cycles of up to 4 hops in the actual
+	// frame-level yield graph. A yield edge can come from either braking
+	// blame or "hold speed instead of accelerating" blame.
+	released := detectDeadlockReleases(len(cars), tentativeLinks, holdLinks, flags, holdSpeed)
+	for i := range released {
+		if !released[i] {
+			continue
+		}
+		flags[i] = false
+		holdSpeed[i] = false
+	}
+
 	debugLinks := make([]DebugBlameLink, 0, len(tentativeLinks))
 	for _, link := range tentativeLinks {
 		if link.FromCarIndex >= 0 && link.FromCarIndex < len(flags) && flags[link.FromCarIndex] {
 			debugLinks = append(debugLinks, link)
 		}
 	}
+	activeHoldLinks := make([]DebugBlameLink, 0, len(holdLinks))
+	for _, link := range holdLinks {
+		if link.FromCarIndex >= 0 && link.FromCarIndex < len(holdSpeed) && holdSpeed[link.FromCarIndex] {
+			activeHoldLinks = append(activeHoldLinks, link)
+		}
+	}
 
-	return flags, holdSpeed, debugLinks, holdLinks
+	return flags, holdSpeed, debugLinks, activeHoldLinks
 }
 
 func shouldBrakeForBlamedConflicts(carIndex int, cars []Car, graph *RoadGraph, predictions [][]TrajectorySample) bool {
@@ -4205,6 +4178,70 @@ func hasBlamedConflictWithPrediction(carIndex int, testCar Car, testPrediction [
 		}
 	}
 	return false
+}
+
+func detectDeadlockReleases(numCars int, brakeLinks, holdLinks []DebugBlameLink, braking []bool, holdSpeed []bool) []bool {
+	if numCars <= 1 {
+		return nil
+	}
+
+	outgoing := make([][]int, numCars)
+	addActiveLinks := func(links []DebugBlameLink, active []bool) {
+		for _, link := range links {
+			if link.FromCarIndex < 0 || link.FromCarIndex >= numCars || link.ToCarIndex < 0 || link.ToCarIndex >= numCars {
+				continue
+			}
+			if link.FromCarIndex >= len(active) || !active[link.FromCarIndex] {
+				continue
+			}
+			outgoing[link.FromCarIndex] = append(outgoing[link.FromCarIndex], link.ToCarIndex)
+		}
+	}
+	addActiveLinks(brakeLinks, braking)
+	addActiveLinks(holdLinks, holdSpeed)
+
+	released := make([]bool, numCars)
+	path := make([]int, 4)
+	for start := 0; start < numCars; start++ {
+		if len(outgoing[start]) == 0 {
+			continue
+		}
+		path[0] = start
+		var search func(pathLen int)
+		search = func(pathLen int) {
+			cur := path[pathLen-1]
+			for _, next := range outgoing[cur] {
+				if next == start {
+					minIdx := path[0]
+					for i := 1; i < pathLen; i++ {
+						if path[i] < minIdx {
+							minIdx = path[i]
+						}
+					}
+					released[minIdx] = true
+					continue
+				}
+				if pathLen >= len(path) {
+					continue
+				}
+				repeated := false
+				for i := 0; i < pathLen; i++ {
+					if path[i] == next {
+						repeated = true
+						break
+					}
+				}
+				if repeated {
+					continue
+				}
+				path[pathLen] = next
+				search(pathLen + 1)
+			}
+		}
+		search(1)
+	}
+
+	return released
 }
 
 func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []TrajectorySample {
