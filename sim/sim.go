@@ -8,8 +8,10 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -241,6 +243,36 @@ type BrakingProfile struct {
 	HoldCars            int
 }
 
+type holdProbeCarResult struct {
+	shouldHold                bool
+	holdLink                  DebugBlameLink
+	hasHoldLink               bool
+	candidateLinks            []DebugBlameLink
+	fasterPredictions         int
+	stationaryPredictions     int
+	totalPredictionSamples    int
+	holdCollisionChecks       int
+	holdCollisionHits         int
+	stationaryCollisionChecks int
+	stationaryCollisionHits   int
+}
+
+type basePredictionCarResult struct {
+	prediction   []TrajectorySample
+	pose         carPose
+	reach        float32
+	geometry     collisionGeometry
+	totalSamples int
+}
+
+type brakeProbeCarResult struct {
+	shouldBrake            bool
+	escapePredictions      int
+	totalPredictionSamples int
+	escapeCollisionChecks  int
+	escapeCollisionHits    int
+}
+
 type pathCacheKey struct {
 	StartID     int
 	EndID       int
@@ -278,6 +310,7 @@ type RoadGraph struct {
 	startsByNode    map[string][]int
 	routeNeighbors  [][]int
 	segmentCosts    []float32
+	pathCacheMu     sync.RWMutex
 	pathCache       map[pathCacheKey]pathCacheEntry
 	pathCacheHits   int
 	pathCacheMisses int
@@ -381,11 +414,11 @@ type World struct {
 	DebugSelectedCar     int
 	DebugSelectedCarMode int // 0 = primary candidates, 1 = hold candidates
 	DebugCandidateLinks  []DebugBlameLink
-	BasePathHits    int
-	BasePathMisses  int
-	AllPathHits     int
-	AllPathMisses   int
-	BrakingProfile  BrakingProfile
+	BasePathHits         int
+	BasePathMisses       int
+	AllPathHits          int
+	AllPathMisses        int
+	BrakingProfile       BrakingProfile
 
 	RouteVisualsMS float64
 	LaneChangesMS  float64
@@ -450,6 +483,49 @@ func (w *World) ResetTransientState() {
 
 func sinceMS(start time.Time) float64 {
 	return float64(time.Since(start).Microseconds()) / 1000.0
+}
+
+func parallelWorkerCount(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > n {
+		workers = n
+	}
+	return workers
+}
+
+func parallelFor(n int, fn func(start, end int)) {
+	if n <= 0 {
+		return
+	}
+	workers := parallelWorkerCount(n)
+	if workers <= 1 {
+		fn(0, n)
+		return
+	}
+	chunkSize := (n + workers - 1) / workers
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		start := worker * chunkSize
+		if start >= n {
+			break
+		}
+		end := start + chunkSize
+		if end > n {
+			end = n
+		}
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			fn(start, end)
+		}(start, end)
+	}
+	wg.Wait()
 }
 
 func (w *World) Step(dt float32) {
@@ -1430,26 +1506,20 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph, debugSelectedCar int,
 	}
 
 	basePredictStart := time.Now()
+	baseResults := computeBasePredictionResults(cars, graph)
 	predictions := make([][]TrajectorySample, len(cars))
 	stationaryPredictions := make([][]TrajectorySample, len(cars))
-	geometries := buildCollisionGeometries(cars)
+	geometries := make([]collisionGeometry, len(cars))
 	poses := make([]carPose, len(cars))
 	reach := make([]float32, len(cars))
-	for i, car := range cars {
-		if spline, ok := graph.splineByID(car.CurrentSplineID); ok {
-			pos, heading := sampleSplineAtDistance(spline, car.DistanceOnSpline)
-			poses[i] = carPose{pos: pos, heading: heading}
-		}
-		physicalSize := maxf(car.Length, car.Width)
-		if car.Trailer.HasTrailer {
-			physicalSize = car.Length + car.Trailer.Length
-		}
-		reach[i] = maxf(car.Speed, 0)*predictionHorizonSeconds + 0.5*car.Accel*predictionHorizonSeconds*predictionHorizonSeconds +
-			physicalSize + collisionBroadPhaseSlackM
-		predictions[i] = predictCarTrajectory(car, graph, predictionHorizonSeconds, predictionStepSeconds)
+	for i, result := range baseResults {
+		predictions[i] = result.prediction
+		geometries[i] = result.geometry
+		poses[i] = result.pose
+		reach[i] = result.reach
 		profile.BasePredictions++
 		profile.TotalPredictions++
-		profile.TotalPredictionSamples += len(predictions[i])
+		profile.TotalPredictionSamples += result.totalSamples
 	}
 	profile.BasePredictMS = sinceMS(basePredictStart)
 
@@ -1561,81 +1631,35 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph, debugSelectedCar int,
 	profile.ConflictScanMS = sinceMS(conflictScanStart)
 
 	brakeProbeStart := time.Now()
-	for i := range cars {
-		if !initialBlame[i] {
-			continue
-		}
-		if shouldBrakeForBlamedConflicts(i, cars, graph, predictions, geometries, poses, reach, trajAABBs, &grid, &profile) {
+	for i, result := range computeBrakeProbeResults(cars, graph, initialBlame, predictions, geometries, poses, reach, trajAABBs, &grid) {
+		if result.shouldBrake {
 			flags[i] = true
 		}
+		profile.EscapePredictions += result.escapePredictions
+		profile.TotalPredictions += result.escapePredictions
+		profile.TotalPredictionSamples += result.totalPredictionSamples
+		profile.EscapeCollisionChecks += result.escapeCollisionChecks
+		profile.EscapeCollisionHits += result.escapeCollisionHits
 	}
 	profile.BrakeProbeMS = sinceMS(brakeProbeStart)
 
 	holdProbeStart := time.Now()
-	for i, car := range cars {
-		if flags[i] || len(predictions[i]) == 0 {
-			continue
+	for i, result := range computeHoldProbeResults(cars, graph, flags, debugSelectedCar, debugSelectedCarMode, predictions, stationaryPredictions, geometries, poses, reach, trajAABBs, &grid) {
+		if result.shouldHold {
+			holdSpeed[i] = true
 		}
-		fasterCar := car
-		fasterCar.Speed += 0.25 * fasterCar.Accel
-		if fasterCar.Speed <= car.Speed+1e-4 {
-			continue
+		if result.hasHoldLink {
+			holdLinks = append(holdLinks, result.holdLink)
 		}
-		fasterPred := predictCarTrajectory(fasterCar, graph, predictionHorizonSeconds, predictionStepSeconds)
-		profile.FasterPredictions++
-		profile.TotalPredictions++
-		profile.TotalPredictionSamples += len(fasterPred)
-		if len(fasterPred) == 0 {
-			continue
-		}
-		fasterAABB := buildTrajectoryAABB(fasterPred, geometries[i].coarseRadius)
-		neighborBuf = grid.queryNeighbors(poses[i].pos, neighborBuf)
-		for _, j := range neighborBuf {
-			if j == i || len(predictions[j]) == 0 {
-				continue
-			}
-			scale := closingRateScale(poses[i].pos, poses[j].pos, poses[i].heading, poses[j].heading, cars[i].Speed, cars[j].Speed)
-			broadPhaseDist := (reach[i] + reach[j]) * scale * scale
-			if distSq(poses[i].pos, poses[j].pos) > broadPhaseDist*broadPhaseDist {
-				continue
-			}
-			if !aabbOverlap(fasterAABB, trajAABBs[j]) {
-				continue
-			}
-			if debugSelectedCar >= 0 && debugSelectedCarMode == 1 && i == debugSelectedCar {
-				candidateLinks = append(candidateLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
-			}
-			profile.HoldCollisionChecks++
-			collision, ok := predictCollision(fasterPred, predictions[j], geometries[i], geometries[j])
-			if !ok {
-				continue
-			}
-			profile.HoldCollisionHits++
-			blameI, _ := determineBlame(collision, fasterCar, cars[j], graph.splines)
-			if blameI && !recentlyLeft(fasterCar, cars[j].CurrentSplineID) {
-				if collision.AlreadyCollided {
-					holdSpeed[i] = true
-					holdLinks = append(holdLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
-					break
-				}
-				if stationaryPredictions[i] == nil {
-					sc := cars[i]
-					sc.Speed = 0
-					stationaryPredictions[i] = predictCarTrajectory(sc, graph, predictionHorizonSeconds, predictionStepSeconds)
-					profile.StationaryPredictions++
-					profile.TotalPredictions++
-					profile.TotalPredictionSamples += len(stationaryPredictions[i])
-				}
-				profile.StationaryCollisionChecks++
-				if _, still := predictCollision(stationaryPredictions[i], predictions[j], geometries[i], geometries[j]); !still {
-					holdSpeed[i] = true
-					holdLinks = append(holdLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
-					break
-				} else {
-					profile.StationaryCollisionHits++
-				}
-			}
-		}
+		candidateLinks = append(candidateLinks, result.candidateLinks...)
+		profile.FasterPredictions += result.fasterPredictions
+		profile.StationaryPredictions += result.stationaryPredictions
+		profile.TotalPredictions += result.fasterPredictions + result.stationaryPredictions
+		profile.TotalPredictionSamples += result.totalPredictionSamples
+		profile.HoldCollisionChecks += result.holdCollisionChecks
+		profile.HoldCollisionHits += result.holdCollisionHits
+		profile.StationaryCollisionChecks += result.stationaryCollisionChecks
+		profile.StationaryCollisionHits += result.stationaryCollisionHits
 	}
 	profile.HoldProbeMS = sinceMS(holdProbeStart)
 
@@ -1674,6 +1698,138 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph, debugSelectedCar int,
 	profile.FinalizeMS = sinceMS(finalizeStart)
 
 	return flags, holdSpeed, debugLinks, activeHoldLinks, candidateLinks, profile
+}
+
+func computeBasePredictionResults(cars []Car, graph *RoadGraph) []basePredictionCarResult {
+	results := make([]basePredictionCarResult, len(cars))
+	parallelFor(len(cars), func(start, end int) {
+		for i := start; i < end; i++ {
+			car := cars[i]
+			result := &results[i]
+			if spline, ok := graph.splineByID(car.CurrentSplineID); ok {
+				pos, heading := sampleSplineAtDistance(spline, car.DistanceOnSpline)
+				result.pose = carPose{pos: pos, heading: heading}
+			}
+			physicalSize := maxf(car.Length, car.Width)
+			if car.Trailer.HasTrailer {
+				physicalSize = car.Length + car.Trailer.Length
+			}
+			result.reach = maxf(car.Speed, 0)*predictionHorizonSeconds + 0.5*car.Accel*predictionHorizonSeconds*predictionHorizonSeconds +
+				physicalSize + collisionBroadPhaseSlackM
+			result.geometry = buildCollisionGeometry(car)
+			result.prediction = predictCarTrajectory(car, graph, predictionHorizonSeconds, predictionStepSeconds)
+			result.totalSamples = len(result.prediction)
+		}
+	})
+	return results
+}
+
+func computeBrakeProbeResults(cars []Car, graph *RoadGraph, initialBlame []bool, predictions [][]TrajectorySample, geometries []collisionGeometry, poses []carPose, reach []float32, trajAABBs []trajectoryAABB, grid *spatialGrid) []brakeProbeCarResult {
+	results := make([]brakeProbeCarResult, len(cars))
+	parallelFor(len(cars), func(start, end int) {
+		for i := start; i < end; i++ {
+			if i >= len(initialBlame) || !initialBlame[i] {
+				continue
+			}
+			var localProfile BrakingProfile
+			results[i] = brakeProbeCarResult{
+				shouldBrake:            shouldBrakeForBlamedConflicts(i, cars, graph, predictions, geometries, poses, reach, trajAABBs, grid, &localProfile),
+				escapePredictions:      localProfile.EscapePredictions,
+				totalPredictionSamples: localProfile.TotalPredictionSamples,
+				escapeCollisionChecks:  localProfile.EscapeCollisionChecks,
+				escapeCollisionHits:    localProfile.EscapeCollisionHits,
+			}
+		}
+	})
+	return results
+}
+
+func computeHoldProbeResults(cars []Car, graph *RoadGraph, flags []bool, debugSelectedCar int, debugSelectedCarMode int, predictions [][]TrajectorySample, stationaryPredictions [][]TrajectorySample, geometries []collisionGeometry, poses []carPose, reach []float32, trajAABBs []trajectoryAABB, grid *spatialGrid) []holdProbeCarResult {
+	results := make([]holdProbeCarResult, len(cars))
+	if len(cars) == 0 {
+		return results
+	}
+
+	parallelFor(len(cars), func(start, end int) {
+		for i := start; i < end; i++ {
+			results[i] = computeHoldProbeResultForCar(i, cars, graph, flags, debugSelectedCar, debugSelectedCarMode, predictions, stationaryPredictions, geometries, poses, reach, trajAABBs, grid)
+		}
+	})
+	return results
+}
+
+func computeHoldProbeResultForCar(i int, cars []Car, graph *RoadGraph, flags []bool, debugSelectedCar int, debugSelectedCarMode int, predictions [][]TrajectorySample, stationaryPredictions [][]TrajectorySample, geometries []collisionGeometry, poses []carPose, reach []float32, trajAABBs []trajectoryAABB, grid *spatialGrid) holdProbeCarResult {
+	var result holdProbeCarResult
+	if i < 0 || i >= len(cars) || i >= len(predictions) || i >= len(flags) || flags[i] || len(predictions[i]) == 0 {
+		return result
+	}
+
+	car := cars[i]
+	fasterCar := car
+	fasterCar.Speed += 0.25 * fasterCar.Accel
+	if fasterCar.Speed <= car.Speed+1e-4 {
+		return result
+	}
+
+	fasterPred := predictCarTrajectory(fasterCar, graph, predictionHorizonSeconds, predictionStepSeconds)
+	result.fasterPredictions = 1
+	result.totalPredictionSamples += len(fasterPred)
+	if len(fasterPred) == 0 {
+		return result
+	}
+
+	fasterAABB := buildTrajectoryAABB(fasterPred, geometries[i].coarseRadius)
+	neighbors := grid.queryNeighbors(poses[i].pos, nil)
+	stationaryPred := stationaryPredictions[i]
+	for _, j := range neighbors {
+		if j == i || j < 0 || j >= len(predictions) || len(predictions[j]) == 0 {
+			continue
+		}
+		scale := closingRateScale(poses[i].pos, poses[j].pos, poses[i].heading, poses[j].heading, cars[i].Speed, cars[j].Speed)
+		broadPhaseDist := (reach[i] + reach[j]) * scale * scale
+		if distSq(poses[i].pos, poses[j].pos) > broadPhaseDist*broadPhaseDist {
+			continue
+		}
+		if !aabbOverlap(fasterAABB, trajAABBs[j]) {
+			continue
+		}
+		if debugSelectedCar >= 0 && debugSelectedCarMode == 1 && i == debugSelectedCar {
+			result.candidateLinks = append(result.candidateLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
+		}
+		result.holdCollisionChecks++
+		collision, ok := predictCollision(fasterPred, predictions[j], geometries[i], geometries[j])
+		if !ok {
+			continue
+		}
+		result.holdCollisionHits++
+		blameI, _ := determineBlame(collision, fasterCar, cars[j], graph.splines)
+		if !blameI || recentlyLeft(fasterCar, cars[j].CurrentSplineID) {
+			continue
+		}
+		if collision.AlreadyCollided {
+			result.shouldHold = true
+			result.holdLink = DebugBlameLink{FromCarIndex: i, ToCarIndex: j}
+			result.hasHoldLink = true
+			break
+		}
+		if stationaryPred == nil {
+			sc := cars[i]
+			sc.Speed = 0
+			stationaryPred = predictCarTrajectory(sc, graph, predictionHorizonSeconds, predictionStepSeconds)
+			result.stationaryPredictions++
+			result.totalPredictionSamples += len(stationaryPred)
+		}
+		result.stationaryCollisionChecks++
+		if _, still := predictCollision(stationaryPred, predictions[j], geometries[i], geometries[j]); !still {
+			result.shouldHold = true
+			result.holdLink = DebugBlameLink{FromCarIndex: i, ToCarIndex: j}
+			result.hasHoldLink = true
+			break
+		}
+		result.stationaryCollisionHits++
+	}
+
+	return result
 }
 
 func remapBlameLinks(links []DebugBlameLink, remap []int) []DebugBlameLink {
@@ -2158,30 +2314,33 @@ func carHitboxTouchesSpline(car Car, targetSpline Spline, splines []Spline) bool
 
 func buildLookaheadSplineSets(cars []Car, graph *RoadGraph, lookahead float32) []map[int]bool {
 	pathSets := make([]map[int]bool, len(cars))
-	for i, car := range cars {
-		set := map[int]bool{car.CurrentSplineID: true}
-		currentSpline, ok := graph.splineByID(car.CurrentSplineID)
-		if !ok {
+	parallelFor(len(cars), func(start, end int) {
+		for i := start; i < end; i++ {
+			car := cars[i]
+			set := map[int]bool{car.CurrentSplineID: true}
+			currentSpline, ok := graph.splineByID(car.CurrentSplineID)
+			if !ok {
+				pathSets[i] = set
+				continue
+			}
+			covered := currentSpline.Length - car.DistanceOnSpline
+			curID := car.CurrentSplineID
+			for steps := 0; covered < lookahead && steps < len(graph.splines); steps++ {
+				nextID, ok := ChooseNextSplineOnBestPathWithGraph(graph, curID, car.DestinationSplineID, car.VehicleKind)
+				if !ok {
+					break
+				}
+				set[nextID] = true
+				nextSpline, ok := graph.splineByID(nextID)
+				if !ok {
+					break
+				}
+				covered += nextSpline.Length
+				curID = nextID
+			}
 			pathSets[i] = set
-			continue
 		}
-		covered := currentSpline.Length - car.DistanceOnSpline
-		curID := car.CurrentSplineID
-		for steps := 0; covered < lookahead && steps < len(graph.splines); steps++ {
-			nextID, ok := ChooseNextSplineOnBestPathWithGraph(graph, curID, car.DestinationSplineID, car.VehicleKind)
-			if !ok {
-				break
-			}
-			set[nextID] = true
-			nextSpline, ok := graph.splineByID(nextID)
-			if !ok {
-				break
-			}
-			covered += nextSpline.Length
-			curID = nextID
-		}
-		pathSets[i] = set
-	}
+	})
 	return pathSets
 }
 
@@ -2192,61 +2351,67 @@ func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) []float32 {
 	}
 
 	poses := make([]carPose, len(cars))
-	for i, car := range cars {
-		splineIdx, ok := graph.indexByID[car.CurrentSplineID]
-		if !ok {
-			continue
+	parallelFor(len(cars), func(start, end int) {
+		for i := start; i < end; i++ {
+			car := cars[i]
+			splineIdx, ok := graph.indexByID[car.CurrentSplineID]
+			if !ok {
+				continue
+			}
+			p, h := sampleSplineAtDistance(graph.splines[splineIdx], car.DistanceOnSpline)
+			poses[i] = carPose{p, h}
 		}
-		p, h := sampleSplineAtDistance(graph.splines[splineIdx], car.DistanceOnSpline)
-		poses[i] = carPose{p, h}
-	}
+	})
 
 	pathSets := buildLookaheadSplineSets(cars, graph, followLookaheadM)
 
-	for i, car := range cars {
-		hI := poses[i].heading
-		pI := poses[i].pos
-		desiredGap := followMinGapM + car.Speed*followTimeHeadwaySecs
-		bestDist := float32(math.MaxFloat32)
-		bestSpeed := float32(math.MaxFloat32)
+	parallelFor(len(cars), func(start, end int) {
+		for i := start; i < end; i++ {
+			car := cars[i]
+			hI := poses[i].heading
+			pI := poses[i].pos
+			desiredGap := followMinGapM + car.Speed*followTimeHeadwaySecs
+			bestDist := float32(math.MaxFloat32)
+			bestSpeed := float32(math.MaxFloat32)
 
-		for j, other := range cars {
-			if i == j {
-				continue
+			for j, other := range cars {
+				if i == j {
+					continue
+				}
+				if !pathSets[i][other.CurrentSplineID] {
+					continue
+				}
+				hJ := poses[j].heading
+				d := hI.X*hJ.X + hI.Y*hJ.Y
+				if d < followHeadingCos {
+					continue
+				}
+				diff := Vec2{X: poses[j].pos.X - pI.X, Y: poses[j].pos.Y - pI.Y}
+				proj := diff.X*hI.X + diff.Y*hI.Y
+				if proj <= 0 {
+					continue
+				}
+				euclidean := float32(math.Sqrt(float64(diff.X*diff.X + diff.Y*diff.Y)))
+				if euclidean > followLookaheadM {
+					continue
+				}
+				leaderRear := other.RearPosition
+				if other.Trailer.HasTrailer {
+					leaderRear = other.Trailer.RearPosition
+				}
+				rearDiff := vecSub(leaderRear, pI)
+				gap := float32(math.Sqrt(float64(rearDiff.X*rearDiff.X + rearDiff.Y*rearDiff.Y)))
+				if gap > desiredGap {
+					continue
+				}
+				if euclidean < bestDist {
+					bestDist = euclidean
+					bestSpeed = other.Speed
+				}
 			}
-			if !pathSets[i][other.CurrentSplineID] {
-				continue
-			}
-			hJ := poses[j].heading
-			d := hI.X*hJ.X + hI.Y*hJ.Y
-			if d < followHeadingCos {
-				continue
-			}
-			diff := Vec2{X: poses[j].pos.X - pI.X, Y: poses[j].pos.Y - pI.Y}
-			proj := diff.X*hI.X + diff.Y*hI.Y
-			if proj <= 0 {
-				continue
-			}
-			euclidean := float32(math.Sqrt(float64(diff.X*diff.X + diff.Y*diff.Y)))
-			if euclidean > followLookaheadM {
-				continue
-			}
-			leaderRear := other.RearPosition
-			if other.Trailer.HasTrailer {
-				leaderRear = other.Trailer.RearPosition
-			}
-			rearDiff := vecSub(leaderRear, pI)
-			gap := float32(math.Sqrt(float64(rearDiff.X*rearDiff.X + rearDiff.Y*rearDiff.Y)))
-			if gap > desiredGap {
-				continue
-			}
-			if euclidean < bestDist {
-				bestDist = euclidean
-				bestSpeed = other.Speed
-			}
+			caps[i] = bestSpeed
 		}
-		caps[i] = bestSpeed
-	}
+	})
 	return caps
 }
 
@@ -3065,19 +3230,30 @@ func FindShortestPathWeightedWithGraph(graph *RoadGraph, startSplineID, endSplin
 		return nil, 0, false
 	}
 	key := pathCacheKey{StartID: startSplineID, EndID: endSplineID, VehicleKind: vehicleKind}
-	if cached, ok := graph.pathCache[key]; ok {
+	graph.pathCacheMu.RLock()
+	cached, ok := graph.pathCache[key]
+	graph.pathCacheMu.RUnlock()
+	if ok {
+		graph.pathCacheMu.Lock()
 		graph.pathCacheHits++
+		graph.pathCacheMu.Unlock()
 		return append([]int(nil), cached.PathIDs...), cached.Cost, cached.OK
 	}
+	graph.pathCacheMu.Lock()
 	graph.pathCacheMisses++
+	graph.pathCacheMu.Unlock()
 	startIdx, okStart := graph.indexByID[startSplineID]
 	endIdx, okEnd := graph.indexByID[endSplineID]
 	if !okStart || !okEnd {
+		graph.pathCacheMu.Lock()
 		graph.pathCache[key] = pathCacheEntry{OK: false}
+		graph.pathCacheMu.Unlock()
 		return nil, 0, false
 	}
 	if vehicleKind == VehicleCar && startIdx != endIdx && graph.splines[endIdx].BusOnly {
+		graph.pathCacheMu.Lock()
 		graph.pathCache[key] = pathCacheEntry{OK: false}
+		graph.pathCacheMu.Unlock()
 		return nil, 0, false
 	}
 
@@ -3114,7 +3290,9 @@ func FindShortestPathWeightedWithGraph(graph *RoadGraph, startSplineID, endSplin
 	}
 
 	if dist[endIdx] >= inf/2 {
+		graph.pathCacheMu.Lock()
 		graph.pathCache[key] = pathCacheEntry{OK: false}
+		graph.pathCacheMu.Unlock()
 		return nil, 0, false
 	}
 
@@ -3129,11 +3307,13 @@ func FindShortestPathWeightedWithGraph(graph *RoadGraph, startSplineID, endSplin
 	for _, idx := range pathIndices {
 		pathIDs = append(pathIDs, graph.splines[idx].ID)
 	}
+	graph.pathCacheMu.Lock()
 	graph.pathCache[key] = pathCacheEntry{
 		PathIDs: append([]int(nil), pathIDs...),
 		Cost:    dist[endIdx],
 		OK:      true,
 	}
+	graph.pathCacheMu.Unlock()
 	return pathIDs, dist[endIdx], true
 }
 
@@ -3463,9 +3643,11 @@ func buildCollisionGeometry(car Car) collisionGeometry {
 
 func buildCollisionGeometries(cars []Car) []collisionGeometry {
 	geometries := make([]collisionGeometry, len(cars))
-	for i, car := range cars {
-		geometries[i] = buildCollisionGeometry(car)
-	}
+	parallelFor(len(cars), func(start, end int) {
+		for i := start; i < end; i++ {
+			geometries[i] = buildCollisionGeometry(cars[i])
+		}
+	})
 	return geometries
 }
 
