@@ -1216,6 +1216,44 @@ type carPose struct {
 	heading Vec2
 }
 
+type spatialGrid struct {
+	cellSize    float32
+	invCellSize float32
+	cells       map[[2]int32][]int
+}
+
+func newSpatialGrid(cellSize float32, n int) spatialGrid {
+	return spatialGrid{
+		cellSize:    cellSize,
+		invCellSize: 1.0 / cellSize,
+		cells:       make(map[[2]int32][]int, n),
+	}
+}
+
+func (g *spatialGrid) cellKey(p Vec2) [2]int32 {
+	return [2]int32{
+		int32(math.Floor(float64(p.X * g.invCellSize))),
+		int32(math.Floor(float64(p.Y * g.invCellSize))),
+	}
+}
+
+func (g *spatialGrid) insert(index int, p Vec2) {
+	k := g.cellKey(p)
+	g.cells[k] = append(g.cells[k], index)
+}
+
+func (g *spatialGrid) queryNeighbors(p Vec2, buf []int) []int {
+	buf = buf[:0]
+	c := g.cellKey(p)
+	for dx := int32(-1); dx <= 1; dx++ {
+		for dy := int32(-1); dy <= 1; dy++ {
+			k := [2]int32{c[0] + dx, c[1] + dy}
+			buf = append(buf, g.cells[k]...)
+		}
+	}
+	return buf
+}
+
 func recentlyLeft(car Car, splineID int) bool {
 	return splineID >= 0 && (car.PrevSplineIDs[0] == splineID || car.PrevSplineIDs[1] == splineID)
 }
@@ -1248,14 +1286,37 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph) ([]bool, []bool, []De
 		predictions[i] = predictCarTrajectory(car, graph, predictionHorizonSeconds, predictionStepSeconds)
 	}
 
+	var maxReach float32
+	for _, r := range reach {
+		if r > maxReach {
+			maxReach = r
+		}
+	}
+	if maxReach < 1 {
+		maxReach = 1
+	}
+	grid := newSpatialGrid(maxReach, len(cars))
+	for i := range cars {
+		if len(predictions[i]) > 0 {
+			grid.insert(i, poses[i].pos)
+		}
+	}
+
+	seen := make(map[[2]int]bool, len(cars)*4)
+	neighborBuf := make([]int, 0, 32)
 	for i := 0; i < len(cars); i++ {
 		if len(predictions[i]) == 0 {
 			continue
 		}
-		for j := i + 1; j < len(cars); j++ {
-			if len(predictions[j]) == 0 {
+		neighborBuf = grid.queryNeighbors(poses[i].pos, neighborBuf)
+		for _, j := range neighborBuf {
+			if j <= i {
 				continue
 			}
+			if seen[[2]int{i, j}] {
+				continue
+			}
+			seen[[2]int{i, j}] = true
 			broadPhaseDist := reach[i] + reach[j]
 			if distSq(poses[i].pos, poses[j].pos) > broadPhaseDist*broadPhaseDist {
 				continue
@@ -1307,7 +1368,7 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph) ([]bool, []bool, []De
 		if !initialBlame[i] {
 			continue
 		}
-		if shouldBrakeForBlamedConflicts(i, cars, graph, predictions) {
+		if shouldBrakeForBlamedConflicts(i, cars, graph, predictions, poses, reach, &grid) {
 			flags[i] = true
 		}
 	}
@@ -1325,8 +1386,9 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph) ([]bool, []bool, []De
 		if len(fasterPred) == 0 {
 			continue
 		}
-		for j := range cars {
-			if i == j || len(predictions[j]) == 0 {
+		neighborBuf = grid.queryNeighbors(poses[i].pos, neighborBuf)
+		for _, j := range neighborBuf {
+			if j == i || len(predictions[j]) == 0 {
 				continue
 			}
 			broadPhaseDist := reach[i] + reach[j]
@@ -1383,7 +1445,7 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph) ([]bool, []bool, []De
 	return flags, holdSpeed, debugLinks, activeHoldLinks
 }
 
-func shouldBrakeForBlamedConflicts(carIndex int, cars []Car, graph *RoadGraph, predictions [][]TrajectorySample) bool {
+func shouldBrakeForBlamedConflicts(carIndex int, cars []Car, graph *RoadGraph, predictions [][]TrajectorySample, poses []carPose, reach []float32, grid *spatialGrid) bool {
 	if carIndex < 0 || carIndex >= len(cars) {
 		return false
 	}
@@ -1413,7 +1475,7 @@ func shouldBrakeForBlamedConflicts(carIndex int, cars []Car, graph *RoadGraph, p
 		if len(testPrediction) == 0 {
 			return true
 		}
-		if hasBlamedConflictWithPrediction(carIndex, testCar, testPrediction, cars, graph, predictions) {
+		if hasBlamedConflictWithPrediction(carIndex, testCar, testPrediction, cars, graph, predictions, poses, reach, grid) {
 			return true
 		}
 	}
@@ -1421,11 +1483,17 @@ func shouldBrakeForBlamedConflicts(carIndex int, cars []Car, graph *RoadGraph, p
 	return false
 }
 
-func hasBlamedConflictWithPrediction(carIndex int, testCar Car, testPrediction []TrajectorySample, cars []Car, graph *RoadGraph, predictions [][]TrajectorySample) bool {
-	for otherIndex, otherCar := range cars {
+func hasBlamedConflictWithPrediction(carIndex int, testCar Car, testPrediction []TrajectorySample, cars []Car, graph *RoadGraph, predictions [][]TrajectorySample, poses []carPose, reach []float32, grid *spatialGrid) bool {
+	neighbors := grid.queryNeighbors(poses[carIndex].pos, nil)
+	for _, otherIndex := range neighbors {
 		if otherIndex == carIndex || otherIndex >= len(predictions) || len(predictions[otherIndex]) == 0 {
 			continue
 		}
+		broadPhaseDist := reach[carIndex] + reach[otherIndex]
+		if distSq(poses[carIndex].pos, poses[otherIndex].pos) > broadPhaseDist*broadPhaseDist {
+			continue
+		}
+		otherCar := cars[otherIndex]
 		if recentlyLeft(testCar, otherCar.CurrentSplineID) {
 			continue
 		}
