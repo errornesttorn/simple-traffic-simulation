@@ -142,6 +142,7 @@ type Trailer struct {
 }
 
 type Car struct {
+	ID      int
 	RouteID int
 
 	CurrentSplineID      int
@@ -435,24 +436,28 @@ type TrafficCycle struct {
 	Enabled    bool
 }
 
-type World struct {
-	Splines           []Spline
-	LaneChangeSplines []Spline
-	Routes            []Route
-	Cars              []Car
-	TrafficLights     []TrafficLight
-	TrafficCycles     []TrafficCycle
+type TopologyState struct {
+	Splines       []Spline
+	Routes        []Route
+	TrafficLights []TrafficLight
+	TrafficCycles []TrafficCycle
 
 	NextSplineID int
 	NextRouteID  int
 	NextLightID  int
 	NextCycleID  int
+}
+
+type RuntimeState struct {
+	LaneChangeSplines []Spline
+	Cars              []Car
+	NextCarID         int
 
 	RouteVisualsTimer float32
 
 	DebugBlameLinks      []DebugBlameLink
 	HoldBlameLinks       []DebugBlameLink
-	DebugSelectedCar     int
+	DebugSelectedCarID   int
 	DebugSelectedCarMode int // 0 = primary candidates, 1 = hold candidates
 	DebugCandidateLinks  []DebugBlameLink
 	BasePathHits         int
@@ -469,19 +474,29 @@ type World struct {
 	UpdateCarsMS   float64
 }
 
+type World struct {
+	TopologyState
+	RuntimeState
+}
+
 func NewWorld() World {
 	return World{
-		Splines:           make([]Spline, 0, 128),
-		LaneChangeSplines: make([]Spline, 0, 32),
-		Routes:            make([]Route, 0, 32),
-		Cars:              make([]Car, 0, 256),
-		TrafficLights:     make([]TrafficLight, 0),
-		TrafficCycles:     make([]TrafficCycle, 0),
-		NextSplineID:      1,
-		NextRouteID:       1,
-		NextLightID:       1,
-		NextCycleID:       1,
-		DebugSelectedCar:  -1,
+		TopologyState: TopologyState{
+			Splines:       make([]Spline, 0, 128),
+			Routes:        make([]Route, 0, 32),
+			TrafficLights: make([]TrafficLight, 0),
+			TrafficCycles: make([]TrafficCycle, 0),
+			NextSplineID:  1,
+			NextRouteID:   1,
+			NextLightID:   1,
+			NextCycleID:   1,
+		},
+		RuntimeState: RuntimeState{
+			LaneChangeSplines:  make([]Spline, 0, 32),
+			Cars:               make([]Car, 0, 256),
+			NextCarID:          1,
+			DebugSelectedCarID: -1,
+		},
 	}
 }
 
@@ -565,6 +580,8 @@ func cloneDebugBlameLinks(src []DebugBlameLink) []DebugBlameLink {
 
 func (w World) Clone() World {
 	clone := w
+	clone.TopologyState = w.TopologyState
+	clone.RuntimeState = w.RuntimeState
 	clone.Splines = cloneSplines(w.Splines)
 	clone.LaneChangeSplines = cloneSplines(w.LaneChangeSplines)
 	clone.Routes = cloneRoutes(w.Routes)
@@ -620,6 +637,25 @@ func (w *World) ResetTransientState() {
 	w.LaneChangeSplines = w.LaneChangeSplines[:0]
 	w.DebugBlameLinks = nil
 	w.HoldBlameLinks = nil
+	w.DebugCandidateLinks = nil
+	w.DebugSelectedCarID = -1
+	w.DebugSelectedCarMode = 0
+}
+
+func findCarIndexByID(cars []Car, id int) int {
+	if id < 0 {
+		return -1
+	}
+	for i := range cars {
+		if cars[i].ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+func FindCarIndexByID(cars []Car, id int) int {
+	return findCarIndexByID(cars, id)
 }
 
 func sinceMS(start time.Time) float64 {
@@ -699,6 +735,7 @@ func (w *World) Step(dt float32) {
 	allGraph := newRoadGraphFromSlices(w.Splines, w.LaneChangeSplines, vehicleCounts)
 	w.GraphBuildMS += sinceMS(graphStart)
 
+	debugSelectedCar := findCarIndexByID(w.Cars, w.DebugSelectedCarID)
 	var brakingDecisions, holdSpeedDecisions []bool
 	var debugBlameLinks, holdBlameLinks, candidateLinks []DebugBlameLink
 	var brakingProfile BrakingProfile
@@ -710,7 +747,7 @@ func (w *World) Step(dt float32) {
 	go func() {
 		defer wgBrakeFollow.Done()
 		brakingStart := time.Now()
-		brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks, candidateLinks, brakingProfile = computeBrakingDecisions(w.Cars, allGraph, w.DebugSelectedCar, w.DebugSelectedCarMode)
+		brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks, candidateLinks, brakingProfile = computeBrakingDecisions(w.Cars, allGraph, debugSelectedCar, w.DebugSelectedCarMode)
 		brakingMS = sinceMS(brakingStart)
 	}()
 	go func() {
@@ -728,17 +765,16 @@ func (w *World) Step(dt float32) {
 	var indexRemap []int
 	w.Cars, indexRemap = updateCars(w.Cars, w.Routes, allGraph, brakingDecisions, holdSpeedDecisions, followCaps, w.TrafficLights, w.TrafficCycles, dt)
 	w.LaneChangeSplines = gcLaneChangeSplines(w.LaneChangeSplines, w.Cars)
-	w.Routes, w.Cars = updateRouteSpawning(w.Routes, w.Cars, w.Splines, dt)
+	w.Routes, w.Cars = updateRouteSpawning(w.Routes, w.Cars, w.Splines, &w.NextCarID, dt)
 	w.TrafficCycles = UpdateTrafficCycles(w.TrafficCycles, dt)
 	w.UpdateCarsMS = sinceMS(updateCarsStart)
 
 	w.DebugBlameLinks = remapBlameLinks(debugBlameLinks, indexRemap)
 	w.HoldBlameLinks = remapBlameLinks(holdBlameLinks, indexRemap)
 	w.DebugCandidateLinks = remapBlameLinks(candidateLinks, indexRemap)
-	if w.DebugSelectedCar >= 0 && w.DebugSelectedCar < len(indexRemap) {
-		w.DebugSelectedCar = indexRemap[w.DebugSelectedCar]
-	} else if w.DebugSelectedCar >= len(indexRemap) {
-		w.DebugSelectedCar = -1
+	if w.DebugSelectedCarID >= 0 && findCarIndexByID(w.Cars, w.DebugSelectedCarID) < 0 {
+		w.DebugSelectedCarID = -1
+		w.DebugSelectedCarMode = 0
 	}
 	w.BasePathHits = baseGraph.pathCacheHits
 	w.BasePathMisses = baseGraph.pathCacheMisses
@@ -808,6 +844,7 @@ type SavedRoute struct {
 }
 
 type SavedCar struct {
+	ID                   int     `json:"id,omitempty"`
 	RouteID              int     `json:"route_id"`
 	CurrentSplineID      int     `json:"current_spline_id"`
 	DestinationSplineID  int     `json:"destination_spline_id"`
@@ -869,6 +906,7 @@ func (w *World) Save(path string) error {
 	}
 	for _, car := range w.Cars {
 		saved.Cars = append(saved.Cars, SavedCar{
+			ID:                   car.ID,
 			RouteID:              car.RouteID,
 			CurrentSplineID:      car.CurrentSplineID,
 			DestinationSplineID:  car.DestinationSplineID,
@@ -929,7 +967,7 @@ func LoadWorld(path string) (*World, error) {
 	}
 
 	world := NewWorld()
-	maxSplineID, maxRouteID, maxLightID, maxCycleID := 0, 0, 0, 0
+	maxSplineID, maxRouteID, maxLightID, maxCycleID, maxCarID := 0, 0, 0, 0, 0
 
 	world.Splines = make([]Spline, 0, len(saved.Splines))
 	for _, entry := range saved.Splines {
@@ -982,7 +1020,12 @@ func LoadWorld(path string) (*World, error) {
 	}
 	for _, entry := range saved.Cars {
 		vehicleKind := VehicleKindFromString(entry.VehicleKind)
+		carID := entry.ID
+		if carID <= 0 {
+			carID = maxCarID + 1
+		}
 		car := Car{
+			ID:                   carID,
 			RouteID:              entry.RouteID,
 			CurrentSplineID:      entry.CurrentSplineID,
 			DestinationSplineID:  entry.DestinationSplineID,
@@ -1025,6 +1068,9 @@ func LoadWorld(path string) (*World, error) {
 			}
 		}
 		world.Cars = append(world.Cars, car)
+		if carID > maxCarID {
+			maxCarID = carID
+		}
 	}
 
 	world.TrafficLights = make([]TrafficLight, 0, len(saved.TrafficLights))
@@ -1087,6 +1133,7 @@ func LoadWorld(path string) (*World, error) {
 	world.NextRouteID = maxRouteID + 1
 	world.NextLightID = maxLightID + 1
 	world.NextCycleID = maxCycleID + 1
+	world.NextCarID = maxCarID + 1
 	return &world, nil
 }
 
@@ -1284,7 +1331,7 @@ func UpdateRouteVisualsWithGraph(routes []Route, graph *RoadGraph) []Route {
 	return routes
 }
 
-func updateRouteSpawning(routes []Route, cars []Car, splines []Spline, dt float32) ([]Route, []Car) {
+func updateRouteSpawning(routes []Route, cars []Car, splines []Spline, nextCarID *int, dt float32) ([]Route, []Car) {
 	for i := range routes {
 		if !routes[i].Valid || routes[i].SpawnPerMinute <= 0 {
 			continue
@@ -1293,9 +1340,10 @@ func updateRouteSpawning(routes []Route, cars []Car, splines []Spline, dt float3
 		if routes[i].NextSpawnIn > 0 {
 			continue
 		}
-		candidate := spawnVehicle(routes[i], splines)
+		candidate := spawnVehicle(*nextCarID, routes[i], splines)
 		if !spawnBlocked(candidate, cars, splines) {
 			cars = append(cars, candidate)
+			*nextCarID = *nextCarID + 1
 			routes[i].NextSpawnIn = randomizedSpawnDelay(routes[i].SpawnPerMinute)
 		}
 	}
@@ -1342,7 +1390,7 @@ func spawnBlocked(candidate Car, cars []Car, splines []Spline) bool {
 	return false
 }
 
-func spawnVehicle(route Route, splines []Spline) Car {
+func spawnVehicle(carID int, route Route, splines []Spline) Car {
 	hasTrailer := route.VehicleKind == VehicleCar && rand.Float32() < 0.10
 	length := randRange(4.0, 4.8) / metersPerUnit
 	width := randRange(1.8, 2.0) / metersPerUnit
@@ -1364,6 +1412,7 @@ func spawnVehicle(route Route, splines []Spline) Car {
 	}
 
 	car := Car{
+		ID:                   carID,
 		RouteID:              route.ID,
 		CurrentSplineID:      route.StartSplineID,
 		DestinationSplineID:  CurrentRouteTarget(route, 0),

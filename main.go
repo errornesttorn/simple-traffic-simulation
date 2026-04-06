@@ -252,6 +252,85 @@ func bezierPoint(p0, p1, p2, p3 Vec2, t float32) Vec2 {
 
 type Spline = simpkg.Spline
 
+type asyncStepResult struct {
+	World    simpkg.World
+	Revision uint64
+}
+
+type editorWorldState struct {
+	Splines           []Spline
+	LaneChangeSplines []Spline
+	Routes            []Route
+	Cars              []Car
+	TrafficLights     []TrafficLight
+	TrafficCycles     []TrafficCycle
+
+	NextSplineID int
+	NextRouteID  int
+	NextLightID  int
+	NextCycleID  int
+
+	DebugSelectedCarID   int
+	DebugSelectedCarMode int
+}
+
+func newEditorWorldState(world *simpkg.World) editorWorldState {
+	return editorWorldState{
+		Splines:              world.Splines,
+		LaneChangeSplines:    world.LaneChangeSplines,
+		Routes:               world.Routes,
+		Cars:                 world.Cars,
+		TrafficLights:        world.TrafficLights,
+		TrafficCycles:        world.TrafficCycles,
+		NextSplineID:         world.NextSplineID,
+		NextRouteID:          world.NextRouteID,
+		NextLightID:          world.NextLightID,
+		NextCycleID:          world.NextCycleID,
+		DebugSelectedCarID:   world.DebugSelectedCarID,
+		DebugSelectedCarMode: world.DebugSelectedCarMode,
+	}
+}
+
+func (s *editorWorldState) commit(world *simpkg.World) {
+	world.Splines = s.Splines
+	world.LaneChangeSplines = s.LaneChangeSplines
+	world.Routes = s.Routes
+	world.Cars = s.Cars
+	world.TrafficLights = s.TrafficLights
+	world.TrafficCycles = s.TrafficCycles
+	world.NextSplineID = s.NextSplineID
+	world.NextRouteID = s.NextRouteID
+	world.NextLightID = s.NextLightID
+	world.NextCycleID = s.NextCycleID
+	world.DebugSelectedCarID = s.DebugSelectedCarID
+	world.DebugSelectedCarMode = s.DebugSelectedCarMode
+}
+
+func (s *editorWorldState) clearCarDebugSelection() {
+	s.DebugSelectedCarID = -1
+	s.DebugSelectedCarMode = 0
+}
+
+func (s *editorWorldState) handleTopologyChanged() {
+	s.Routes = refreshRoutes(s.Routes, s.Splines)
+	s.Cars = s.Cars[:0]
+	s.LaneChangeSplines = s.LaneChangeSplines[:0]
+	s.clearCarDebugSelection()
+}
+
+func (s *editorWorldState) handleRouteGraphChanged(clearCars bool) {
+	s.Routes = refreshRoutes(s.Routes, s.Splines)
+	s.LaneChangeSplines = s.LaneChangeSplines[:0]
+	if clearCars {
+		s.Cars = s.Cars[:0]
+		s.clearCarDebugSelection()
+	}
+}
+
+func (s *editorWorldState) handleCarsChanged() {
+	s.clearCarDebugSelection()
+}
+
 type Draft struct {
 	P0 Vec2
 	P1 Vec2
@@ -654,6 +733,10 @@ func main() {
 	paused := false
 	noticeText := ""
 	noticeTimer := float32(0)
+	stepResults := make(chan asyncStepResult, 1)
+	stepRunning := false
+	worldRevision := uint64(1)
+	simAccumDT := float32(0)
 
 	resetToolState := func() {
 		stage = StageIdle
@@ -681,8 +764,23 @@ func main() {
 		frameStart := time.Now()
 		frameProf := frameProfile{}
 		inputStart := time.Now()
+
+		select {
+		case result := <-stepResults:
+			stepRunning = false
+			if result.Revision == worldRevision {
+				world = result.World
+			}
+		default:
+		}
+
 		dt := rl.GetFrameTime()
 		camera.Offset = rl.NewVector2(float32(rl.GetScreenWidth())/2, float32(rl.GetScreenHeight())/2)
+		editorMutatedWorld := false
+
+		if !paused {
+			simAccumDT += dt
+		}
 
 		if noticeTimer > 0 {
 			noticeTimer -= dt
@@ -754,6 +852,7 @@ func main() {
 		}
 		if rl.IsKeyPressed(rl.KeySpace) && activeDurInput == -1 {
 			paused = !paused
+			editorMutatedWorld = true
 		}
 		if isCtrlDown() && rl.IsKeyPressed(rl.KeyS) {
 			paused = true
@@ -784,6 +883,7 @@ func main() {
 				} else {
 					world = *loadedWorld
 					paused = true
+					editorMutatedWorld = true
 					stage = StageIdle
 					draft = newDraft()
 					quadraticDraft = newQuadraticDraft()
@@ -840,20 +940,17 @@ func main() {
 			}
 		}
 
-		if !paused {
-			world.Step(dt)
-		}
-
-		splines := world.Splines
-		laneChangeSplines := world.LaneChangeSplines
-		routes := world.Routes
-		cars := world.Cars
-		trafficLights := world.TrafficLights
-		trafficCycles := world.TrafficCycles
-		nextSplineID := world.NextSplineID
-		nextRouteID := world.NextRouteID
-		nextLightID := world.NextLightID
-		nextCycleID := world.NextCycleID
+		editorState := newEditorWorldState(&world)
+		splines := editorState.Splines
+		laneChangeSplines := editorState.LaneChangeSplines
+		routes := editorState.Routes
+		cars := editorState.Cars
+		trafficLights := editorState.TrafficLights
+		trafficCycles := editorState.TrafficCycles
+		nextSplineID := editorState.NextSplineID
+		nextRouteID := editorState.NextRouteID
+		nextLightID := editorState.NextLightID
+		nextCycleID := editorState.NextCycleID
 
 		hoverRadius := pixelsToWorld(camera.Zoom, hoverPixels)
 		snapRadius := pixelsToWorld(camera.Zoom, snapPixels)
@@ -888,19 +985,18 @@ func main() {
 		if debugMode && rl.IsMouseButtonPressed(rl.MouseButtonMiddle) && !mouseOnToolbar {
 			clicked := findClickedCar(cars, allSplines, simpkg.BuildSplineIndexByID(allSplines), mouseWorld)
 			if clicked < 0 {
-				world.DebugSelectedCar = -1
-				world.DebugSelectedCarMode = 0
-			} else if clicked == world.DebugSelectedCar {
-				if world.DebugSelectedCarMode == 0 {
-					world.DebugSelectedCarMode = 1
+				editorState.clearCarDebugSelection()
+			} else if cars[clicked].ID == editorState.DebugSelectedCarID {
+				if editorState.DebugSelectedCarMode == 0 {
+					editorState.DebugSelectedCarMode = 1
 				} else {
-					world.DebugSelectedCar = -1
-					world.DebugSelectedCarMode = 0
+					editorState.clearCarDebugSelection()
 				}
 			} else {
-				world.DebugSelectedCar = clicked
-				world.DebugSelectedCarMode = 0
+				editorState.DebugSelectedCarID = cars[clicked].ID
+				editorState.DebugSelectedCarMode = 0
 			}
+			editorMutatedWorld = true
 		}
 
 		if routePanel.Open {
@@ -908,6 +1004,8 @@ func main() {
 			routePanel, routes, cars, applied = updateRoutePanel(routePanel, routes, cars, &nextRouteID, baseGraph, splines, mouseScreen)
 			if applied {
 				routeStartSplineID = -1
+				editorState.handleCarsChanged()
+				editorMutatedWorld = true
 			}
 		}
 
@@ -928,18 +1026,30 @@ func main() {
 				var topologyChanged bool
 				stage, draft, splines, nextSplineID, topologyChanged = handleEditMode(stage, draft, splines, hoveredSpline, hoveredNode, splineToolMouse, geometrySnap, nextSplineID)
 				if topologyChanged {
-					routes = refreshRoutes(routes, splines)
-					cars = cars[:0]
-					laneChangeSplines = laneChangeSplines[:0]
+					editorState.Splines = splines
+					editorState.Routes = routes
+					editorState.Cars = cars
+					editorState.LaneChangeSplines = laneChangeSplines
+					editorState.handleTopologyChanged()
+					routes = editorState.Routes
+					cars = editorState.Cars
+					laneChangeSplines = editorState.LaneChangeSplines
+					editorMutatedWorld = true
 				}
 			case ToolQuadratic:
 				var topologyChanged bool
 				var notice string
 				stage, quadraticDraft, splines, nextSplineID, topologyChanged, notice = handleQuadraticMode(stage, quadraticDraft, splines, hoveredSpline, hoveredNode, splineToolMouse, geometrySnap, nextSplineID)
 				if topologyChanged {
-					routes = refreshRoutes(routes, splines)
-					cars = cars[:0]
-					laneChangeSplines = laneChangeSplines[:0]
+					editorState.Splines = splines
+					editorState.Routes = routes
+					editorState.Cars = cars
+					editorState.LaneChangeSplines = laneChangeSplines
+					editorState.handleTopologyChanged()
+					routes = editorState.Routes
+					cars = editorState.Cars
+					laneChangeSplines = editorState.LaneChangeSplines
+					editorMutatedWorld = true
 				}
 				if notice != "" {
 					noticeText = notice
@@ -949,9 +1059,15 @@ func main() {
 				var topologyChanged bool
 				splines, trafficLights, topologyChanged = handleReverseMode(splines, trafficLights, hoveredSpline)
 				if topologyChanged {
-					routes = refreshRoutes(routes, splines)
-					cars = cars[:0]
-					laneChangeSplines = laneChangeSplines[:0]
+					editorState.Splines = splines
+					editorState.Routes = routes
+					editorState.Cars = cars
+					editorState.LaneChangeSplines = laneChangeSplines
+					editorState.handleTopologyChanged()
+					routes = editorState.Routes
+					cars = editorState.Cars
+					laneChangeSplines = editorState.LaneChangeSplines
+					editorMutatedWorld = true
 				}
 			case ToolRouteCars:
 				var notice string
@@ -964,8 +1080,13 @@ func main() {
 				var notice string
 				if routeStartSplineID < 0 && rl.IsMouseButtonPressed(rl.MouseButtonRight) && hoveredSpline >= 0 {
 					splines, notice = toggleBusOnlySpline(splines, hoveredSpline)
-					routes = refreshRoutes(routes, splines)
-					laneChangeSplines = laneChangeSplines[:0]
+					editorState.Splines = splines
+					editorState.Routes = routes
+					editorState.LaneChangeSplines = laneChangeSplines
+					editorState.handleRouteGraphChanged(false)
+					routes = editorState.Routes
+					laneChangeSplines = editorState.LaneChangeSplines
+					editorMutatedWorld = true
 				} else {
 					routeStartSplineID, routePanel, notice = handleRouteMode(routeStartSplineID, routePanel, routes, baseGraph, hoveredStart, hoveredEnd, VehicleBus)
 				}
@@ -975,11 +1096,22 @@ func main() {
 				}
 			case ToolRouteEraser:
 				cars = eraseCarsAtPoint(cars, allSplines, simpkg.BuildSplineIndexByID(allSplines), mouseWorld, 5.0)
+				if len(cars) != len(editorState.Cars) {
+					editorState.handleCarsChanged()
+					editorMutatedWorld = true
+				}
 			case ToolPriority:
 				splines = handlePriorityMode(splines, hoveredSpline)
+				if hoveredSpline >= 0 && (rl.IsMouseButtonPressed(rl.MouseButtonLeft) || rl.IsMouseButtonPressed(rl.MouseButtonRight)) {
+					editorMutatedWorld = true
+				}
 			case ToolCouple:
 				var coupleNotice string
+				prevFirstID := coupleModeFirstID
 				coupleModeFirstID, splines, coupleNotice = handleCoupleMode(coupleModeFirstID, splines, hoveredSpline)
+				if rl.IsMouseButtonPressed(rl.MouseButtonLeft) && prevFirstID >= 0 && hoveredSpline >= 0 && splines[hoveredSpline].ID != prevFirstID {
+					editorMutatedWorld = true
+				}
 				if coupleNotice != "" {
 					noticeText = coupleNotice
 					noticeTimer = 3.0
@@ -988,15 +1120,27 @@ func main() {
 				var topologyChanged bool
 				stage, cutDraft, splines, nextSplineID, topologyChanged = handleCutMode(stage, cutDraft, splines, mouseWorld, nextSplineID)
 				if topologyChanged {
-					routes = refreshRoutes(routes, splines)
-					cars = cars[:0]
-					laneChangeSplines = laneChangeSplines[:0]
+					editorState.Splines = splines
+					editorState.Routes = routes
+					editorState.Cars = cars
+					editorState.LaneChangeSplines = laneChangeSplines
+					editorState.handleTopologyChanged()
+					routes = editorState.Routes
+					cars = editorState.Cars
+					laneChangeSplines = editorState.LaneChangeSplines
+					editorMutatedWorld = true
 				}
 			case ToolSpeedLimit:
 				splines = handleSpeedLimitMode(splines, hoveredSpline, selectedSpeedKmh)
 				selectedSpeedKmh = updateSpeedLimitPanel(selectedSpeedKmh)
+				if hoveredSpline >= 0 && (rl.IsMouseButtonPressed(rl.MouseButtonLeft) || rl.IsMouseButtonPressed(rl.MouseButtonRight)) {
+					editorMutatedWorld = true
+				}
 			case ToolPreference:
 				splines, lastPref = handlePreferenceMode(splines, hoveredSpline, lastPref)
+				if hoveredSpline >= 0 && (rl.IsMouseButtonPressed(rl.MouseButtonLeft) || rl.IsMouseButtonPressed(rl.MouseButtonRight)) {
+					editorMutatedWorld = true
+				}
 			case ToolTrafficLight:
 				phaseCount := 0
 				if editingCycleID >= 0 {
@@ -1043,6 +1187,7 @@ func main() {
 					}
 					if rl.IsKeyPressed(rl.KeyEnter) || rl.IsKeyPressed(rl.KeyKpEnter) {
 						trafficCycles = commitDurInput(trafficCycles, editingCycleID, activeDurInput, durInputStr)
+						editorMutatedWorld = true
 						activeDurInput = -1
 						durInputStr = ""
 					}
@@ -1063,6 +1208,7 @@ func main() {
 							}
 							if !rl.CheckCollisionPointRec(mouseScreenRL, activeField) {
 								trafficCycles = commitDurInput(trafficCycles, editingCycleID, activeDurInput, durInputStr)
+								editorMutatedWorld = true
 								activeDurInput = -1
 								durInputStr = ""
 							}
@@ -1088,6 +1234,7 @@ func main() {
 							btn := trafficCreateBtnRect(len(pendingLights))
 							if rl.CheckCollisionPointRec(mouseScreenRL, btn) {
 								pendingLights, trafficLights, trafficCycles, editingCycleID = doCreateTrafficCycle(pendingLights, trafficLights, trafficCycles, &nextCycleID)
+								editorMutatedWorld = true
 							}
 						}
 					} else {
@@ -1096,6 +1243,7 @@ func main() {
 						// On/Off toggle
 						if rl.CheckCollisionPointRec(mouseScreenRL, onOffBtnR) {
 							trafficCycles = trafficToggleCycleEnabled(trafficCycles, editingCycleID)
+							editorMutatedWorld = true
 							// turning on: clear all editing/preview state
 							if !cycleIsOn {
 								editingLights = false
@@ -1119,6 +1267,7 @@ func main() {
 						// Add Phase button (only when cycle is off)
 						if !cycleIsOn && rl.CheckCollisionPointRec(mouseScreenRL, trafficAddPhaseBtnRect(pr)) {
 							trafficCycles = trafficAddPhase(trafficCycles, editingCycleID)
+							editorMutatedWorld = true
 						}
 						// Per-phase row buttons
 						for pi := 0; pi < phaseCount; pi++ {
@@ -1140,6 +1289,7 @@ func main() {
 							if !cycleIsOn {
 								if rl.CheckCollisionPointRec(mouseScreenRL, row.upBtn) && pi > 0 {
 									trafficCycles = trafficMovePhase(trafficCycles, editingCycleID, pi, -1)
+									editorMutatedWorld = true
 									if editingPhaseIdx == pi {
 										editingPhaseIdx--
 									}
@@ -1149,6 +1299,7 @@ func main() {
 								}
 								if rl.CheckCollisionPointRec(mouseScreenRL, row.downBtn) && pi < phaseCount-1 {
 									trafficCycles = trafficMovePhase(trafficCycles, editingCycleID, pi, +1)
+									editorMutatedWorld = true
 									if editingPhaseIdx == pi {
 										editingPhaseIdx++
 									}
@@ -1189,6 +1340,7 @@ func main() {
 								}
 								if rl.CheckCollisionPointRec(mouseScreenRL, row.delBtn) {
 									trafficCycles = trafficDeletePhase(trafficCycles, editingCycleID, pi)
+									editorMutatedWorld = true
 									if editingPhaseIdx == pi {
 										editingPhaseIdx = -1
 									} else if editingPhaseIdx > pi {
@@ -1210,10 +1362,14 @@ func main() {
 						if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
 							if hitID := trafficLightAt(trafficLights, mouseWorld, camera.Zoom); hitID >= 0 {
 								trafficCycles = trafficToggleLightInPhase(trafficCycles, editingCycleID, editingPhaseIdx, hitID)
+								editorMutatedWorld = true
 							}
 						}
 					} else if editingCycleID >= 0 && editingLights {
 						trafficLights, trafficCycles = handleTrafficLightEdit(splines, trafficLights, trafficCycles, editingCycleID, mouseWorld, camera.Zoom, &nextLightID)
+						if rl.IsMouseButtonPressed(rl.MouseButtonLeft) || rl.IsMouseButtonPressed(rl.MouseButtonRight) {
+							editorMutatedWorld = true
+						}
 					} else if editingCycleID < 0 {
 						if rl.IsMouseButtonPressed(rl.MouseButtonLeft) && len(pendingLights) == 0 {
 							if hitID := trafficLightAt(trafficLights, mouseWorld, camera.Zoom); hitID >= 0 {
@@ -1234,16 +1390,33 @@ func main() {
 			}
 		}
 
-		world.Splines = splines
-		world.LaneChangeSplines = laneChangeSplines
-		world.Routes = routes
-		world.Cars = cars
-		world.TrafficLights = trafficLights
-		world.TrafficCycles = trafficCycles
-		world.NextSplineID = nextSplineID
-		world.NextRouteID = nextRouteID
-		world.NextLightID = nextLightID
-		world.NextCycleID = nextCycleID
+		editorState.Splines = splines
+		editorState.LaneChangeSplines = laneChangeSplines
+		editorState.Routes = routes
+		editorState.Cars = cars
+		editorState.TrafficLights = trafficLights
+		editorState.TrafficCycles = trafficCycles
+		editorState.NextSplineID = nextSplineID
+		editorState.NextRouteID = nextRouteID
+		editorState.NextLightID = nextLightID
+		editorState.NextCycleID = nextCycleID
+		editorState.commit(&world)
+
+		if editorMutatedWorld {
+			worldRevision++
+			simAccumDT = 0
+		}
+		if !paused && !stepRunning && simAccumDT > 0 {
+			stepWorld := world.Clone()
+			stepRevision := worldRevision
+			stepDT := simAccumDT
+			simAccumDT = 0
+			stepRunning = true
+			go func(snapshot simpkg.World, revision uint64, dt float32) {
+				snapshot.Step(dt)
+				stepResults <- asyncStepResult{World: snapshot, Revision: revision}
+			}(stepWorld, stepRevision, stepDT)
+		}
 
 		drawStart := time.Now()
 		rl.BeginDrawing()
@@ -1386,7 +1559,7 @@ func main() {
 			} else {
 				drawDebugBlameLinks(debugCandidateLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(180, 50, 220, 200), viewRect)
 			}
-			if sel := world.DebugSelectedCar; sel >= 0 && sel < len(cars) {
+			if sel := simpkg.FindCarIndexByID(cars, world.DebugSelectedCarID); sel >= 0 && sel < len(cars) {
 				if _, center, _, ok := carBodyPose(cars[sel], allSplines, allSplineIndexByID); ok {
 					r := pixelsToWorld(camera.Zoom, 8)
 					ringColor := NewColor(50, 220, 50, 255)
