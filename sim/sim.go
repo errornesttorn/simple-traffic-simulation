@@ -2708,6 +2708,7 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 	for i, route := range routes {
 		routeIndexByID[route.ID] = i
 	}
+	stoppingLightsBySpline := buildStoppingTrafficLightsBySpline(lights, cycles)
 
 	indexRemap := make([]int, len(cars))
 	for i := range indexRemap {
@@ -2797,7 +2798,7 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 			if at := computeAnticipatoryTargetSpeed(car, currentSpline, graph); at < targetSpeed {
 				targetSpeed = at
 			}
-			if tl := computeTrafficLightSpeedCap(car, currentSpline, graph, lights, cycles); tl < targetSpeed {
+			if tl := computeTrafficLightSpeedCap(car, currentSpline, graph, stoppingLightsBySpline); tl < targetSpeed {
 				targetSpeed = tl
 			}
 			if bs := computeBusStopSpeedCap(car, route, currentSpline, graph); bs < targetSpeed {
@@ -3389,24 +3390,64 @@ func lookupCurveSpeed(spline *Spline, dist float32) float32 {
 	return spline.CurveSpeedMPS[idx]
 }
 
-func trafficLightShouldStop(l TrafficLight, cycles []TrafficCycle) bool {
-	if l.CycleID < 0 {
-		return false
+func buildStoppingTrafficLightsBySpline(lights []TrafficLight, cycles []TrafficCycle) map[int][]TrafficLight {
+	if len(lights) == 0 || len(cycles) == 0 {
+		return nil
 	}
+
+	lightsByCycle := make(map[int][]TrafficLight, len(cycles))
+	for _, l := range lights {
+		if l.CycleID >= 0 {
+			lightsByCycle[l.CycleID] = append(lightsByCycle[l.CycleID], l)
+		}
+	}
+
+	stoppingBySpline := make(map[int][]TrafficLight)
 	for _, c := range cycles {
-		if c.ID != l.CycleID {
+		cycleLights := lightsByCycle[c.ID]
+		if len(cycleLights) == 0 || !c.Enabled || len(c.Phases) == 0 {
 			continue
 		}
-		if !c.Enabled {
-			return false
+
+		n := len(c.Phases)
+		ei := c.PhaseIndex
+		if n <= 1 || ei%2 == 0 {
+			userIdx := ei / 2
+			if userIdx >= n {
+				userIdx = n - 1
+			}
+			green := make(map[int]bool, len(c.Phases[userIdx].GreenLightIDs))
+			for _, lightID := range c.Phases[userIdx].GreenLightIDs {
+				green[lightID] = true
+			}
+			for _, l := range cycleLights {
+				if !green[l.ID] {
+					stoppingBySpline[l.SplineID] = append(stoppingBySpline[l.SplineID], l)
+				}
+			}
+			continue
 		}
-		state := TrafficLightState(l.ID, l.CycleID, cycles)
-		return state == TrafficRed || state == TrafficYellow
+
+		prevIdx := (ei / 2) % n
+		nextIdx := (prevIdx + 1) % n
+		prevGreen := make(map[int]bool, len(c.Phases[prevIdx].GreenLightIDs))
+		nextGreen := make(map[int]bool, len(c.Phases[nextIdx].GreenLightIDs))
+		for _, lightID := range c.Phases[prevIdx].GreenLightIDs {
+			prevGreen[lightID] = true
+		}
+		for _, lightID := range c.Phases[nextIdx].GreenLightIDs {
+			nextGreen[lightID] = true
+		}
+		for _, l := range cycleLights {
+			if !prevGreen[l.ID] || !nextGreen[l.ID] {
+				stoppingBySpline[l.SplineID] = append(stoppingBySpline[l.SplineID], l)
+			}
+		}
 	}
-	return false
+	return stoppingBySpline
 }
 
-func computeTrafficLightSpeedCap(car Car, currentSpline *Spline, graph *RoadGraph, lights []TrafficLight, cycles []TrafficCycle) float32 {
+func computeTrafficLightSpeedCap(car Car, currentSpline *Spline, graph *RoadGraph, stoppingLightsBySpline map[int][]TrafficLight) float32 {
 	decel := car.Accel * 1.5
 	result := float32(math.MaxFloat32)
 	remaining := currentSpline.Length - car.DistanceOnSpline
@@ -3427,8 +3468,8 @@ func computeTrafficLightSpeedCap(car Car, currentSpline *Spline, graph *RoadGrap
 		}
 	}
 
-	for _, l := range lights {
-		if l.SplineID != currentSpline.ID || l.DistOnSpline <= car.DistanceOnSpline || !trafficLightShouldStop(l, cycles) {
+	for _, l := range stoppingLightsBySpline[currentSpline.ID] {
+		if l.DistOnSpline <= car.DistanceOnSpline {
 			continue
 		}
 		checkLight(l.DistOnSpline - car.DistanceOnSpline)
@@ -3438,10 +3479,7 @@ func computeTrafficLightSpeedCap(car Car, currentSpline *Spline, graph *RoadGrap
 		nextID, ok := ChooseNextSplineOnBestPathWithGraph(graph, currentSpline.ID, car.DestinationSplineID, car.VehicleKind)
 		if ok {
 			if _, ok2 := graph.splinePtrByID(nextID); ok2 {
-				for _, l := range lights {
-					if l.SplineID != nextID || !trafficLightShouldStop(l, cycles) {
-						continue
-					}
+				for _, l := range stoppingLightsBySpline[nextID] {
 					checkLight(remaining + l.DistOnSpline)
 				}
 			}
