@@ -1,16 +1,16 @@
+//go:build !darwin
+
 package main
 
 import (
 	"fmt"
 	"math"
 	"math/rand"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"simple-traffic-simulation/internal/filepicker"
 	simpkg "simple-traffic-simulation/sim"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
@@ -856,7 +856,7 @@ func main() {
 		}
 		if isCtrlDown() && rl.IsKeyPressed(rl.KeyS) {
 			paused = true
-			path, err := pickSplineFilePath(true)
+			path, err := filepicker.PickSplineFilePath(true)
 			if err != nil {
 				noticeText = fmt.Sprintf("Save failed: %v", err)
 				noticeTimer = 3.0
@@ -871,7 +871,7 @@ func main() {
 			}
 		}
 		if isCtrlDown() && rl.IsKeyPressed(rl.KeyO) {
-			path, err := pickSplineFilePath(false)
+			path, err := filepicker.PickSplineFilePath(false)
 			if err != nil {
 				noticeText = fmt.Sprintf("Load failed: %v", err)
 				noticeTimer = 3.0
@@ -5360,99 +5360,6 @@ func removeCarsForRoute(cars []Car, routeID int) []Car {
 		}
 	}
 	return kept
-}
-
-func pickSplineFilePath(save bool) (string, error) {
-	home, _ := os.UserHomeDir()
-	startDir := home
-	if startDir == "" {
-		startDir = "."
-	}
-	defaultPath := filepath.Join(startDir, "splines.json")
-
-	type picker struct {
-		name string
-		run  func(bool, string) (string, error)
-	}
-
-	pickers := []picker{
-		{name: "zenity", run: pickFileWithZenity},
-		{name: "yad", run: pickFileWithYad},
-		{name: "kdialog", run: pickFileWithKDialog},
-	}
-
-	var missing []string
-	for _, picker := range pickers {
-		if _, err := exec.LookPath(picker.name); err != nil {
-			missing = append(missing, picker.name)
-			continue
-		}
-		path, err := picker.run(save, defaultPath)
-		if err != nil {
-			return "", err
-		}
-		return normalizePickedPath(path, save), nil
-	}
-
-	return "", fmt.Errorf("no supported file dialog found; install zenity, yad, or kdialog")
-}
-
-func pickFileWithZenity(save bool, defaultPath string) (string, error) {
-	args := []string{"--file-selection", "--title=Select spline file"}
-	if save {
-		args = append(args, "--save", "--confirm-overwrite")
-	}
-	args = append(args, "--filename="+defaultPath, "--file-filter=Spline JSON | *.json")
-	return runDialogCommand("zenity", args...)
-}
-
-func pickFileWithYad(save bool, defaultPath string) (string, error) {
-	args := []string{"--file", "--title=Select spline file"}
-	if save {
-		args = append(args, "--save", "--confirm-overwrite")
-	}
-	args = append(args, "--filename="+defaultPath, "--file-filter=*.json")
-	return runDialogCommand("yad", args...)
-}
-
-func pickFileWithKDialog(save bool, defaultPath string) (string, error) {
-	filter := "JSON files (*.json)"
-	if save {
-		return runDialogCommand("kdialog", "--getsavefilename", defaultPath, filter)
-	}
-	return runDialogCommand("kdialog", "--getopenfilename", defaultPath, filter)
-}
-
-func runDialogCommand(name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
-	output, err := cmd.Output()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			code := exitErr.ExitCode()
-			if code == 1 {
-				return "", nil
-			}
-			stderr := strings.TrimSpace(string(exitErr.Stderr))
-			if stderr != "" {
-				return "", fmt.Errorf("%s: %s", name, stderr)
-			}
-			return "", fmt.Errorf("%s exited with code %d", name, code)
-		}
-		return "", err
-	}
-	return strings.TrimSpace(string(output)), nil
-}
-
-func normalizePickedPath(path string, save bool) string {
-	path = strings.TrimSpace(path)
-	path = strings.TrimPrefix(path, "file://")
-	if path == "" {
-		return ""
-	}
-	if save && filepath.Ext(path) == "" {
-		path += ".json"
-	}
-	return path
 }
 
 func isCtrlDown() bool {

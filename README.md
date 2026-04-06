@@ -18,7 +18,9 @@ Bus lines even
 
 - Go 1.22+
 - Raylib support on your machine so `raylib-go` can build
-- `zenity`, `yad`, or `kdialog` if you want the built-in file picker for `Ctrl+S` / `Ctrl+O`
+- Linux: `zenity`, `yad`, or `kdialog` if you want the built-in file picker for `Ctrl+S` / `Ctrl+O`
+- Windows: PowerShell for the built-in file picker
+- macOS is not supported
 
 ```bash
 go run .
@@ -62,4 +64,3 @@ The simulation core is not tied to Raylib. The `sim` package exposes the core ty
 That means you can use this repository as more than just an editor. If you want to build another tool on top of it, `sim` already gives you scenario loading/saving, route computation, graph queries, spline sampling, traffic-light state updates, and per-step world simulation.
 
 The current desktop app is one consumer of that package. Another project could just as well use `sim` headlessly, attach a different renderer, or wrap it in custom gameplay or planning logic.
-
