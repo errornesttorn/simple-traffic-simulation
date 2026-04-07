@@ -2867,54 +2867,26 @@ func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) ([]float32, Followi
 	profile.PoseMS = sinceMS(poseStart)
 
 	indexStart := time.Now()
-	carsBySpline := make(map[int][]int, len(graph.splines))
+	carsBySpline := make([][]int, len(graph.splines))
 	for i := range cars {
-		sid := cars[i].CurrentSplineID
-		carsBySpline[sid] = append(carsBySpline[sid], i)
+		if splineIdx, ok := graph.indexByID[cars[i].CurrentSplineID]; ok {
+			carsBySpline[splineIdx] = append(carsBySpline[splineIdx], i)
+		}
 	}
 	profile.IndexMS = sinceMS(indexStart)
-
-	lookaheadCandidates := make([][]int, len(cars))
-	candidateStart := time.Now()
-	parallelFor(len(cars), func(start, end int) {
-		for i := start; i < end; i++ {
-			car := cars[i]
-			var candidates []int
-			candidates = append(candidates, carsBySpline[car.CurrentSplineID]...)
-			currentSpline, ok := graph.splinePtrByID(car.CurrentSplineID)
-			if !ok {
-				lookaheadCandidates[i] = candidates
-				continue
-			}
-			covered := currentSpline.Length - car.DistanceOnSpline
-			curID := car.CurrentSplineID
-			for steps := 0; covered < followLookaheadM && steps < len(graph.splines); steps++ {
-				nextID, ok := ChooseNextSplineOnBestPathWithGraph(graph, curID, car.DestinationSplineID, car.VehicleKind)
-				if !ok {
-					break
-				}
-				candidates = append(candidates, carsBySpline[nextID]...)
-				nextSpline, ok := graph.splinePtrByID(nextID)
-				if !ok {
-					break
-				}
-				covered += nextSpline.Length
-				curID = nextID
-			}
-			lookaheadCandidates[i] = candidates
-		}
-	})
-	for i := range lookaheadCandidates {
-		profile.CandidateRefs += len(lookaheadCandidates[i])
-	}
-	profile.CandidateMS = sinceMS(candidateStart)
 
 	followLookaheadSq := followLookaheadM * followLookaheadM
 
 	scanStart := time.Now()
+	var candidateRefs atomic.Int64
 	parallelFor(len(cars), func(start, end int) {
+		localRefs := int64(0)
 		for i := start; i < end; i++ {
 			car := cars[i]
+			currentSplineIdx, ok := graph.indexByID[car.CurrentSplineID]
+			if !ok {
+				continue
+			}
 			hI := poses[i].heading
 			pI := poses[i].pos
 			desiredGap := followMinGapM + car.Speed*followTimeHeadwaySecs
@@ -2922,41 +2894,68 @@ func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) ([]float32, Followi
 			bestDistSq := float32(math.MaxFloat32)
 			bestSpeed := float32(math.MaxFloat32)
 
-			for _, j := range lookaheadCandidates[i] {
-				if j == i {
-					continue
+			evalSplineCars := func(splineIdx int) {
+				for _, j := range carsBySpline[splineIdx] {
+					localRefs++
+					if j == i {
+						continue
+					}
+					hJ := poses[j].heading
+					d := hI.X*hJ.X + hI.Y*hJ.Y
+					if d < followHeadingCos {
+						continue
+					}
+					diff := Vec2{X: poses[j].pos.X - pI.X, Y: poses[j].pos.Y - pI.Y}
+					proj := diff.X*hI.X + diff.Y*hI.Y
+					if proj <= 0 {
+						continue
+					}
+					dSq := diff.X*diff.X + diff.Y*diff.Y
+					if dSq > followLookaheadSq {
+						continue
+					}
+					leaderRear := cars[j].RearPosition
+					if cars[j].Trailer.HasTrailer {
+						leaderRear = cars[j].Trailer.RearPosition
+					}
+					rearDiff := vecSub(leaderRear, pI)
+					gapSq := rearDiff.X*rearDiff.X + rearDiff.Y*rearDiff.Y
+					if gapSq > desiredGapSq {
+						continue
+					}
+					if dSq < bestDistSq {
+						bestDistSq = dSq
+						bestSpeed = cars[j].Speed
+					}
 				}
-				hJ := poses[j].heading
-				d := hI.X*hJ.X + hI.Y*hJ.Y
-				if d < followHeadingCos {
-					continue
-				}
-				diff := Vec2{X: poses[j].pos.X - pI.X, Y: poses[j].pos.Y - pI.Y}
-				proj := diff.X*hI.X + diff.Y*hI.Y
-				if proj <= 0 {
-					continue
-				}
-				dSq := diff.X*diff.X + diff.Y*diff.Y
-				if dSq > followLookaheadSq {
-					continue
-				}
-				leaderRear := cars[j].RearPosition
-				if cars[j].Trailer.HasTrailer {
-					leaderRear = cars[j].Trailer.RearPosition
-				}
-				rearDiff := vecSub(leaderRear, pI)
-				gapSq := rearDiff.X*rearDiff.X + rearDiff.Y*rearDiff.Y
-				if gapSq > desiredGapSq {
-					continue
-				}
-				if dSq < bestDistSq {
-					bestDistSq = dSq
-					bestSpeed = cars[j].Speed
+			}
+
+			evalSplineCars(currentSplineIdx)
+
+			currentSpline := graph.splines[currentSplineIdx]
+			covered := currentSpline.Length - car.DistanceOnSpline
+			tree, ok := graph.routeTree(car.DestinationSplineID, car.VehicleKind)
+			if ok {
+				curIdx := currentSplineIdx
+				for steps := 0; covered < followLookaheadM && steps < len(graph.splines); steps++ {
+					if curIdx < 0 || curIdx >= len(tree.nextHop) {
+						break
+					}
+					nextIdx := tree.nextHop[curIdx]
+					if nextIdx < 0 || nextIdx >= len(graph.splines) || nextIdx == curIdx {
+						break
+					}
+					evalSplineCars(nextIdx)
+					covered += graph.splines[nextIdx].Length
+					curIdx = nextIdx
 				}
 			}
 			caps[i] = bestSpeed
 		}
+		candidateRefs.Add(localRefs)
 	})
+	profile.CandidateRefs = int(candidateRefs.Load())
+	profile.CandidateMS = 0
 	profile.ScanMS = sinceMS(scanStart)
 	return caps, profile
 }

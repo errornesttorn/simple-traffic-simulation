@@ -1,7 +1,7 @@
 package sim
 
 /*
-#cgo CFLAGS: -O3 -march=native -fopenmp
+#cgo CFLAGS: -Ofast -march=native -fopenmp -flto
 #cgo LDFLAGS: -fopenmp -lm
 #include "braking.h"
 #include <stdlib.h>
