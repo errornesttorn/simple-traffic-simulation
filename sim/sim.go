@@ -218,11 +218,16 @@ type collisionGeometry struct {
 type BrakingProfile struct {
 	Cars int
 
+	MarshalMS      float64
+	RouteTreeMS    float64
+	MarshalSetupMS float64
 	BasePredictMS  float64
 	ConflictScanMS float64
 	BrakeProbeMS   float64
 	HoldProbeMS    float64
 	FinalizeMS     float64
+	KernelMS       float64
+	UnmarshalMS    float64
 
 	BasePredictions        int
 	StationaryPredictions  int
@@ -523,6 +528,7 @@ type RuntimeState struct {
 	BrakingMS      float64
 	FollowMS       float64
 	UpdateCarsMS   float64
+	StepMS         float64
 
 	permanentGraphTopology    *roadGraphTopology
 	permanentGraphTopologyKey uint64
@@ -905,12 +911,14 @@ func (w *World) permanentRoadGraphTopology() *roadGraphTopology {
 }
 
 func (w *World) Step(dt float32) {
+	stepStart := time.Now()
 	w.RouteVisualsMS = 0
 	w.LaneChangesMS = 0
 	w.GraphBuildMS = 0
 	w.BrakingMS = 0
 	w.FollowMS = 0
 	w.UpdateCarsMS = 0
+	w.StepMS = 0
 	w.BrakingProfile = BrakingProfile{}
 	w.FollowingProfile = FollowingProfile{}
 	w.UpdateCarsProfile = UpdateCarsProfile{}
@@ -984,6 +992,7 @@ func (w *World) Step(dt float32) {
 	w.BasePathMisses = int(baseGraph.pathCacheMisses.Load())
 	w.AllPathHits = int(allGraph.pathCacheHits.Load())
 	w.AllPathMisses = int(allGraph.pathCacheMisses.Load())
+	w.StepMS = sinceMS(stepStart)
 }
 
 type SavedSplineFile struct {

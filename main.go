@@ -448,6 +448,7 @@ type RoadGraph = simpkg.RoadGraph
 type frameProfile struct {
 	frameMS          float64
 	inputMS          float64
+	stepMS           float64
 	routeVisualsMS   float64
 	laneChangesMS    float64
 	graphBuildMS     float64
@@ -480,6 +481,7 @@ func (p *profiler) endFrame(sample frameProfile) {
 	}
 	p.smooth.frameMS = blendMetric(p.smooth.frameMS, sample.frameMS, alpha)
 	p.smooth.inputMS = blendMetric(p.smooth.inputMS, sample.inputMS, alpha)
+	p.smooth.stepMS = blendMetric(p.smooth.stepMS, sample.stepMS, alpha)
 	p.smooth.routeVisualsMS = blendMetric(p.smooth.routeVisualsMS, sample.routeVisualsMS, alpha)
 	p.smooth.laneChangesMS = blendMetric(p.smooth.laneChangesMS, sample.laneChangesMS, alpha)
 	p.smooth.graphBuildMS = blendMetric(p.smooth.graphBuildMS, sample.graphBuildMS, alpha)
@@ -487,11 +489,15 @@ func (p *profiler) endFrame(sample frameProfile) {
 	p.smooth.followMS = blendMetric(p.smooth.followMS, sample.followMS, alpha)
 	p.smooth.updateCarsMS = blendMetric(p.smooth.updateCarsMS, sample.updateCarsMS, alpha)
 	p.smooth.drawMS = blendMetric(p.smooth.drawMS, sample.drawMS, alpha)
+	p.smooth.brakingDetail.MarshalMS = blendMetric(p.smooth.brakingDetail.MarshalMS, sample.brakingDetail.MarshalMS, alpha)
+	p.smooth.brakingDetail.MarshalSetupMS = blendMetric(p.smooth.brakingDetail.MarshalSetupMS, sample.brakingDetail.MarshalSetupMS, alpha)
 	p.smooth.brakingDetail.BasePredictMS = blendMetric(p.smooth.brakingDetail.BasePredictMS, sample.brakingDetail.BasePredictMS, alpha)
 	p.smooth.brakingDetail.ConflictScanMS = blendMetric(p.smooth.brakingDetail.ConflictScanMS, sample.brakingDetail.ConflictScanMS, alpha)
 	p.smooth.brakingDetail.BrakeProbeMS = blendMetric(p.smooth.brakingDetail.BrakeProbeMS, sample.brakingDetail.BrakeProbeMS, alpha)
 	p.smooth.brakingDetail.HoldProbeMS = blendMetric(p.smooth.brakingDetail.HoldProbeMS, sample.brakingDetail.HoldProbeMS, alpha)
 	p.smooth.brakingDetail.FinalizeMS = blendMetric(p.smooth.brakingDetail.FinalizeMS, sample.brakingDetail.FinalizeMS, alpha)
+	p.smooth.brakingDetail.KernelMS = blendMetric(p.smooth.brakingDetail.KernelMS, sample.brakingDetail.KernelMS, alpha)
+	p.smooth.brakingDetail.UnmarshalMS = blendMetric(p.smooth.brakingDetail.UnmarshalMS, sample.brakingDetail.UnmarshalMS, alpha)
 	p.smooth.basePathHits = sample.basePathHits
 	p.smooth.basePathMisses = sample.basePathMisses
 	p.smooth.allPathHits = sample.allPathHits
@@ -992,6 +998,7 @@ func main() {
 		frameProf.basePathMisses = world.BasePathMisses
 		frameProf.allPathHits = world.AllPathHits
 		frameProf.allPathMisses = world.AllPathMisses
+		frameProf.stepMS = world.StepMS
 		frameProf.routeVisualsMS = world.RouteVisualsMS
 		frameProf.laneChangesMS = world.LaneChangesMS
 		frameProf.graphBuildMS = world.GraphBuildMS
@@ -4578,6 +4585,7 @@ func drawProfilerOverlay(prof profiler) {
 	lines := []string{
 		fmt.Sprintf("Frame      %6.2f ms   avg %6.2f", cur.frameMS, avg.frameMS),
 		fmt.Sprintf("Input      %6.2f ms   avg %6.2f", cur.inputMS, avg.inputMS),
+		fmt.Sprintf("Step       %6.2f ms   avg %6.2f", cur.stepMS, avg.stepMS),
 		fmt.Sprintf("RouteVis   %6.2f ms   avg %6.2f", cur.routeVisualsMS, avg.routeVisualsMS),
 		fmt.Sprintf("LaneChange %6.2f ms   avg %6.2f", cur.laneChangesMS, avg.laneChangesMS),
 		fmt.Sprintf("GraphBuild %6.2f ms   avg %6.2f", cur.graphBuildMS, avg.graphBuildMS),
@@ -4595,11 +4603,16 @@ func drawProfilerOverlay(prof profiler) {
 		fmt.Sprintf("UpdMix     dwell %d  fast %d  trans %d  rm %d", cur.updateCarsDetail.DwellCars, cur.updateCarsDetail.FastPathCars, cur.updateCarsDetail.TransitionCars, cur.updateCarsDetail.RemovedCars),
 		fmt.Sprintf("Draw       %6.2f ms   avg %6.2f", cur.drawMS, avg.drawMS),
 		fmt.Sprintf("Cars       %4d", cur.brakingDetail.Cars),
+		fmt.Sprintf("BrkMarshal %6.2f ms   avg %6.2f", cur.brakingDetail.MarshalMS, avg.brakingDetail.MarshalMS),
+		fmt.Sprintf("BrkRoute   %6.2f ms   avg %6.2f", cur.brakingDetail.RouteTreeMS, avg.brakingDetail.RouteTreeMS),
+		fmt.Sprintf("BrkSetup   %6.2f ms   avg %6.2f", cur.brakingDetail.MarshalSetupMS, avg.brakingDetail.MarshalSetupMS),
 		fmt.Sprintf("BrkBase    %6.2f ms   avg %6.2f", cur.brakingDetail.BasePredictMS, avg.brakingDetail.BasePredictMS),
 		fmt.Sprintf("BrkScan    %6.2f ms   avg %6.2f", cur.brakingDetail.ConflictScanMS, avg.brakingDetail.ConflictScanMS),
 		fmt.Sprintf("BrkEscape  %6.2f ms   avg %6.2f", cur.brakingDetail.BrakeProbeMS, avg.brakingDetail.BrakeProbeMS),
 		fmt.Sprintf("BrkHold    %6.2f ms   avg %6.2f", cur.brakingDetail.HoldProbeMS, avg.brakingDetail.HoldProbeMS),
 		fmt.Sprintf("BrkFinal   %6.2f ms   avg %6.2f", cur.brakingDetail.FinalizeMS, avg.brakingDetail.FinalizeMS),
+		fmt.Sprintf("BrkKernel  %6.2f ms   avg %6.2f", cur.brakingDetail.KernelMS, avg.brakingDetail.KernelMS),
+		fmt.Sprintf("BrkUnpack  %6.2f ms   avg %6.2f", cur.brakingDetail.UnmarshalMS, avg.brakingDetail.UnmarshalMS),
 		fmt.Sprintf("Preds      base %d  stat %d  esc %d  fast %d", cur.brakingDetail.BasePredictions, cur.brakingDetail.StationaryPredictions, cur.brakingDetail.EscapePredictions, cur.brakingDetail.FasterPredictions),
 		fmt.Sprintf("PredSamp   total %d  calls %d", cur.brakingDetail.TotalPredictionSamples, cur.brakingDetail.TotalPredictions),
 		fmt.Sprintf("PrimPairs  cand %d  broad %d", cur.brakingDetail.PrimaryPairCandidates, cur.brakingDetail.PrimaryBroadPhasePairs),

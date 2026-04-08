@@ -11,7 +11,7 @@
 #define SIM_SAMPLE_COUNT     (SIM_SAMPLES + 1)  /* 97 */
 #define MAX_TRAJ_SAMPLES     22   /* ceil(3.0/0.15) + 1 */
 #define MAX_HITBOX_CIRCLES   8
-#define DEADLOCK_MAX_PATH    4
+#define DEADLOCK_MAX_PATH    6
 
 #define PREDICTION_HORIZON_S 3.0f
 #define PREDICTION_STEP_S    0.15f
@@ -103,7 +103,11 @@ typedef struct {
     int     *sbn_offsets;     /* per-spline start into sbn_data */
     int     *sbn_counts;      /* per-spline successor count     */
     int     *sbn_data;        /* flat successor indices          */
+    int     *rev_offsets;     /* per-spline start into rev_data */
+    int     *rev_counts;      /* per-spline predecessor count   */
+    int     *rev_data;        /* flat predecessor indices        */
     int     *hard_coupled_ids;
+    float   *segment_costs;   /* [num_splines], dynamic per frame */
 } CGraph;
 
 /* ── spatial grid ──────────────────────────────────────────────── */
@@ -135,8 +139,8 @@ typedef struct {
     int escape_collision_checks, escape_collision_hits;
     int hold_collision_checks, hold_collision_hits;
     int initially_blamed_cars, braking_cars, hold_cars;
-    double base_predict_ms, conflict_scan_ms, brake_probe_ms;
-    double hold_probe_ms, finalize_ms;
+    double route_tree_ms, marshal_setup_ms, base_predict_ms, conflict_scan_ms, brake_probe_ms;
+    double hold_probe_ms, finalize_ms, total_ms;
 } CBrakingProfile;
 
 typedef struct {
@@ -144,7 +148,8 @@ typedef struct {
     CCar       *cars;
     int         num_cars;
     CGraph      graph;
-    CRouteTree *route_trees;
+    int        *route_tree_dest_ids;
+    int        *route_tree_vehicle_kinds;
     int         num_route_trees;
     int         debug_selected_car;
     int         debug_selected_car_mode;

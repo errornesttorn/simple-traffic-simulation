@@ -160,6 +160,104 @@ static inline int is_spline_usable(const CSpline *s, int vehicle_kind) {
    Route tree navigation
    ═══════════════════════════════════════════════════════════════════ */
 
+typedef struct {
+    int idx;
+    float dist;
+} RouteHeapItem;
+
+typedef struct {
+    RouteHeapItem *items;
+    int len;
+    int cap;
+} RouteHeap;
+
+static void route_heap_push(RouteHeap *h, int idx, float dist) {
+    if (h->len >= h->cap) {
+        int next_cap = h->cap > 0 ? h->cap * 2 : 64;
+        h->items = (RouteHeapItem *)realloc(h->items, sizeof(RouteHeapItem) * next_cap);
+        h->cap = next_cap;
+    }
+    int at = h->len++;
+    h->items[at] = (RouteHeapItem){idx, dist};
+    while (at > 0) {
+        int parent = (at - 1) / 2;
+        if (h->items[parent].dist <= h->items[at].dist) break;
+        RouteHeapItem tmp = h->items[parent];
+        h->items[parent] = h->items[at];
+        h->items[at] = tmp;
+        at = parent;
+    }
+}
+
+static RouteHeapItem route_heap_pop(RouteHeap *h) {
+    RouteHeapItem out = h->items[0];
+    h->len--;
+    if (h->len > 0) {
+        h->items[0] = h->items[h->len];
+        int at = 0;
+        for (;;) {
+            int left = at * 2 + 1;
+            int right = left + 1;
+            int best = at;
+            if (left < h->len && h->items[left].dist < h->items[best].dist) best = left;
+            if (right < h->len && h->items[right].dist < h->items[best].dist) best = right;
+            if (best == at) break;
+            RouteHeapItem tmp = h->items[best];
+            h->items[best] = h->items[at];
+            h->items[at] = tmp;
+            at = best;
+        }
+    }
+    return out;
+}
+
+static CRouteTree build_route_tree(const CGraph *g, int destination_spline_id, int vehicle_kind) {
+    int n = g->num_splines;
+    int alloc_n = n > 0 ? n : 1;
+    float *costs = (float *)malloc(sizeof(float) * alloc_n);
+    int *next_hop = (int *)malloc(sizeof(int) * alloc_n);
+    for (int i = 0; i < n; i++) {
+        costs[i] = ROUTE_COST_INF;
+        next_hop[i] = -1;
+    }
+    if (n == 0) {
+        return (CRouteTree){costs, next_hop};
+    }
+
+    int dest_idx = graph_index_by_id(g, destination_spline_id);
+    if (dest_idx < 0 || dest_idx >= n) {
+        return (CRouteTree){costs, next_hop};
+    }
+
+    costs[dest_idx] = g->segment_costs[dest_idx];
+    next_hop[dest_idx] = dest_idx;
+    if (vehicle_kind == VEHICLE_CAR && g->splines[dest_idx].bus_only) {
+        return (CRouteTree){costs, next_hop};
+    }
+
+    RouteHeap heap = {0};
+    route_heap_push(&heap, dest_idx, costs[dest_idx]);
+    while (heap.len > 0) {
+        RouteHeapItem item = route_heap_pop(&heap);
+        if (item.dist != costs[item.idx]) continue;
+        int off = g->rev_offsets[item.idx];
+        int cnt = g->rev_counts[item.idx];
+        for (int i = 0; i < cnt; i++) {
+            int prev_idx = g->rev_data[off + i];
+            if (prev_idx < 0 || prev_idx >= n) continue;
+            if (vehicle_kind == VEHICLE_CAR && g->splines[prev_idx].bus_only) continue;
+            float alt = item.dist + g->segment_costs[prev_idx];
+            if (alt < costs[prev_idx]) {
+                costs[prev_idx] = alt;
+                next_hop[prev_idx] = item.idx;
+                route_heap_push(&heap, prev_idx, alt);
+            }
+        }
+    }
+    free(heap.items);
+    return (CRouteTree){costs, next_hop};
+}
+
 static int choose_next_spline(const CGraph *g, const CRouteTree *tree,
                               int current_spline_id, int vehicle_kind) {
     const CSpline *cur = graph_spline_by_id(g, current_spline_id);
@@ -766,6 +864,22 @@ static int sgrid_query(const CSpatialGrid *g, CVec2 p, int *buf, int buf_cap) {
     return n;
 }
 
+static int compact_unique_indices(int *buf, int n) {
+    int out = 0;
+    for (int i = 0; i < n; i++) {
+        int v = buf[i];
+        int seen = 0;
+        for (int j = 0; j < out; j++) {
+            if (buf[j] == v) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen) buf[out++] = v;
+    }
+    return out;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
    Median reach (for grid cell sizing)
    ═══════════════════════════════════════════════════════════════════ */
@@ -894,6 +1008,7 @@ static int has_blamed_conflict(int ci, const CCar *test_car,
                                int *escape_checks, int *escape_hits) {
     int nbuf[256];
     int nn = sgrid_query(grid, poses[ci].pos, nbuf, 256);
+    nn = compact_unique_indices(nbuf, nn);
     for (int ni = 0; ni < nn; ni++) {
         int oi = nbuf[ni];
         if (oi == ci || oi < 0 || oi >= num_cars || traj_lens[oi] == 0) continue;
@@ -1023,6 +1138,7 @@ static HoldResult compute_hold_for_car(int ci, const CCar *cars, int num_cars,
     /* Pre-filter: does the car's existing AABB overlap any neighbor? */
     int nbuf[256];
     int nn = sgrid_query(grid, poses[ci].pos, nbuf, 256);
+    nn = compact_unique_indices(nbuf, nn);
     int has_nearby = 0;
     for (int ni = 0; ni < nn; ni++) {
         int j = nbuf[ni];
@@ -1115,6 +1231,7 @@ void compute_braking_decisions(CBrakingCtx *ctx) {
     CBrakingProfile *prof = &ctx->profile;
     memset(prof, 0, sizeof(*prof));
     prof->cars = N;
+    double t_all = now_ms();
     ctx->debug_links_count = 0;
     ctx->hold_links_count = 0;
     ctx->candidate_links_count = 0;
@@ -1124,12 +1241,25 @@ void compute_braking_decisions(CBrakingCtx *ctx) {
     if (N < 2) return;
 
     CGraph *g = &ctx->graph;
-    CRouteTree *trees = ctx->route_trees;
+    int tree_count = ctx->num_route_trees > 0 ? ctx->num_route_trees : 1;
+    double t_route = now_ms();
+    CRouteTree *trees = (CRouteTree *)malloc(sizeof(CRouteTree) * tree_count);
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int i = 0; i < tree_count; i++) {
+        int dest_id = -1;
+        int vehicle_kind = VEHICLE_CAR;
+        if (i < ctx->num_route_trees) {
+            dest_id = ctx->route_tree_dest_ids[i];
+            vehicle_kind = ctx->route_tree_vehicle_kinds[i];
+        }
+        trees[i] = build_route_tree(g, dest_id, vehicle_kind);
+    }
+    prof->route_tree_ms = now_ms() - t_route;
 
     /* ── Base predictions ─────────────────────────────────── */
     double t0 = now_ms();
     CTrajSample *all_traj = (CTrajSample *)malloc(sizeof(CTrajSample) * N * MAX_TRAJ_SAMPLES);
-    int *traj_lens = (int *)calloc(N, sizeof(int));
+    int *traj_lens = (int *)malloc(sizeof(int) * N);
     CCollGeom *geoms = (CCollGeom *)malloc(sizeof(CCollGeom) * N);
     CCarPose *poses = (CCarPose *)malloc(sizeof(CCarPose) * N);
     float *reach = (float *)malloc(sizeof(float) * N);
@@ -1169,8 +1299,10 @@ void compute_braking_decisions(CBrakingCtx *ctx) {
     prof->total_predictions = N;
     prof->base_predict_ms = now_ms() - t0;
 
-    /* ── Trajectory AABBs ──────────────────────────────────── */
+    /* ── Trajectory AABBs / grid setup ─────────────────────── */
+    double t_setup = now_ms();
     CAABB *aabbs = (CAABB *)malloc(sizeof(CAABB) * N);
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < N; i++)
         aabbs[i] = build_traj_aabb(&all_traj[i * MAX_TRAJ_SAMPLES], traj_lens[i], geoms[i].coarse_radius);
 
@@ -1185,10 +1317,11 @@ void compute_braking_decisions(CBrakingCtx *ctx) {
     }
 
     /* ── Stationary predictions (shared, lazily filled) ────── */
-    CTrajSample *stat_traj = (CTrajSample *)calloc(N * MAX_TRAJ_SAMPLES, sizeof(CTrajSample));
+    CTrajSample *stat_traj = (CTrajSample *)malloc(sizeof(CTrajSample) * N * MAX_TRAJ_SAMPLES);
     int *stat_lens = (int *)calloc(N, sizeof(int));
     /* Per-car lock: 0=free, 1=computing, 2=done */
     int *stat_lock = (int *)calloc(N, sizeof(int));
+    prof->marshal_setup_ms = now_ms() - t_setup;
 
     /* ── Conflict scan ─────────────────────────────────────── */
     double t1 = now_ms();
@@ -1384,14 +1517,17 @@ void compute_braking_decisions(CBrakingCtx *ctx) {
     double t3 = now_ms();
     /* Per-thread candidate link buffers for hold probe */
     typedef struct {
-        CBlameLink *links; int count, cap;
+        CBlameLink *candidate_links; int candidate_count, candidate_cap;
+        CBlameLink *hold_links; int hold_count, hold_cap;
         int faster_p, stat_p, total_ps, hc, hh, sc, sh;
     } ThreadHold;
     int max_t2 = omp_get_max_threads();
     ThreadHold *thold = (ThreadHold *)calloc(max_t2, sizeof(ThreadHold));
     for (int t = 0; t < max_t2; t++) {
-        thold[t].cap = N > 64 ? N : 64;
-        thold[t].links = (CBlameLink *)malloc(sizeof(CBlameLink) * thold[t].cap);
+        thold[t].candidate_cap = N > 64 ? N : 64;
+        thold[t].candidate_links = (CBlameLink *)malloc(sizeof(CBlameLink) * thold[t].candidate_cap);
+        thold[t].hold_cap = N > 64 ? N : 64;
+        thold[t].hold_links = (CBlameLink *)malloc(sizeof(CBlameLink) * thold[t].hold_cap);
     }
 
     #pragma omp parallel
@@ -1406,14 +1542,11 @@ void compute_braking_decisions(CBrakingCtx *ctx) {
                                                   stat_traj, stat_lens, stat_lock,
                                                   geoms, poses, reach, aabbs, &grid,
                                                   ctx->debug_selected_car, ctx->debug_selected_car_mode,
-                                                  th->links, &th->count, th->cap);
+                                                  th->candidate_links, &th->candidate_count, th->candidate_cap);
             if (hr.should_hold) ctx->hold_flags[i] = 1;
             if (hr.has_hold_link) {
-                #pragma omp critical
-                {
-                    if (ctx->hold_links_count < ctx->hold_links_cap)
-                        ctx->hold_links[ctx->hold_links_count++] = hr.hold_link;
-                }
+                if (th->hold_count < th->hold_cap)
+                    th->hold_links[th->hold_count++] = hr.hold_link;
             }
             th->faster_p  += hr.faster_preds;
             th->stat_p    += hr.stationary_preds;
@@ -1433,11 +1566,16 @@ void compute_braking_decisions(CBrakingCtx *ctx) {
         prof->hold_collision_hits       += thold[t].hh;
         prof->stationary_collision_checks += thold[t].sc;
         prof->stationary_collision_hits += thold[t].sh;
-        for (int k = 0; k < thold[t].count; k++) {
+        for (int k = 0; k < thold[t].candidate_count; k++) {
             if (ctx->candidate_links_count < ctx->candidate_links_cap)
-                ctx->candidate_links[ctx->candidate_links_count++] = thold[t].links[k];
+                ctx->candidate_links[ctx->candidate_links_count++] = thold[t].candidate_links[k];
         }
-        free(thold[t].links);
+        for (int k = 0; k < thold[t].hold_count; k++) {
+            if (ctx->hold_links_count < ctx->hold_links_cap)
+                ctx->hold_links[ctx->hold_links_count++] = thold[t].hold_links[k];
+        }
+        free(thold[t].candidate_links);
+        free(thold[t].hold_links);
     }
     free(thold);
     prof->hold_probe_ms = now_ms() - t3;
@@ -1492,4 +1630,10 @@ void compute_braking_decisions(CBrakingCtx *ctx) {
     free(geoms);
     free(traj_lens);
     free(all_traj);
+    for (int i = 0; i < tree_count; i++) {
+        free(trees[i].costs);
+        free(trees[i].next_hop);
+    }
+    free(trees);
+    prof->total_ms = now_ms() - t_all;
 }
