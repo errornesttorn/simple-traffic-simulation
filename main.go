@@ -26,6 +26,7 @@ import (
 //   E: edit splines mode
 //   R: route mode
 //   B: bus line mode
+//   G: driving mode
 //   P: priority paint mode
 //   D: toggle debug overlay
 //   F3: toggle profiling overlay
@@ -68,6 +69,7 @@ const (
 	ModeRules
 	ModeRoute
 	ModeTraffic
+	ModeDriving
 )
 
 const (
@@ -83,6 +85,7 @@ const (
 	ToolRouteBuses
 	ToolRouteEraser
 	ToolTrafficLight
+	ToolDrive
 )
 
 const (
@@ -255,6 +258,26 @@ type Spline = simpkg.Spline
 type asyncStepResult struct {
 	World    simpkg.World
 	Revision uint64
+}
+
+type playerCarState struct {
+	Active          bool
+	Position        Vec2
+	HeadingDeg      float32
+	Speed           float32
+	Length          float32
+	Width           float32
+	Color           Color
+	MaxForwardSpeed float32
+	MaxReverseSpeed float32
+	AccelMPS2       float32
+	BrakeMPS2       float32
+	CoastMPS2       float32
+	BaseTurnDegPerS float32
+
+	DestinationSplineID int
+	DestinationPoint    Vec2
+	HasDestination      bool
 }
 
 type editorWorldState struct {
@@ -587,6 +610,7 @@ var modeToolbarItems = []modeToolbarItem{
 	{"Ru", "Rules", ModeRules, false, false, false},
 	{"Rt", "Route", ModeRoute, false, false, false},
 	{"Tr", "Traffic", ModeTraffic, false, false, false},
+	{"G", "Drive", ModeDriving, false, false, false},
 	{"I", "Info", 0, false, false, true},
 	{"D", "Debug", 0, true, false, false},
 	{"H", "Hitbox", 0, false, true, false},
@@ -614,6 +638,10 @@ var routeToolItems = []toolToolbarItem{
 
 var trafficToolItems = []toolToolbarItem{
 	{"T", "Traffic", ToolTrafficLight},
+}
+
+var drivingToolItems = []toolToolbarItem{
+	{"G", "Drive", ToolDrive},
 }
 
 const (
@@ -645,6 +673,8 @@ func toolsForMode(mode EditorMode) []toolToolbarItem {
 		return routeToolItems
 	case ModeTraffic:
 		return trafficToolItems
+	case ModeDriving:
+		return drivingToolItems
 	default:
 		return nil
 	}
@@ -660,6 +690,8 @@ func modeForTool(tool EditorTool) EditorMode {
 		return ModeRoute
 	case ToolTrafficLight:
 		return ModeTraffic
+	case ToolDrive:
+		return ModeDriving
 	default:
 		return ModeDraw
 	}
@@ -675,6 +707,8 @@ func defaultToolForMode(mode EditorMode) EditorTool {
 		return ToolRouteCars
 	case ModeTraffic:
 		return ToolTrafficLight
+	case ModeDriving:
+		return ToolDrive
 	default:
 		return ToolSpline
 	}
@@ -688,7 +722,7 @@ func isMouseOverToolbar(mouse Vec2) bool {
 		return true
 	}
 	toolN := 0
-	for _, mode := range []EditorMode{ModeDraw, ModeRules, ModeRoute, ModeTraffic} {
+	for _, mode := range []EditorMode{ModeDraw, ModeRules, ModeRoute, ModeTraffic, ModeDriving} {
 		if n := len(toolsForMode(mode)); n > toolN {
 			toolN = n
 		}
@@ -729,6 +763,8 @@ func main() {
 	)
 
 	world := simpkg.NewWorld()
+	playerCar := playerCarState{}
+	driveRestoreTarget := rl.NewVector2(0, 0)
 
 	mode := ModeDraw
 	tool := ToolSpline
@@ -822,6 +858,8 @@ func main() {
 				setMode(ModeRoute)
 			case ModeRoute:
 				setMode(ModeTraffic)
+			case ModeTraffic:
+				setMode(ModeDriving)
 			default:
 				setMode(ModeDraw)
 			}
@@ -861,6 +899,9 @@ func main() {
 		}
 		if rl.IsKeyPressed(rl.KeyT) {
 			setTool(ToolTrafficLight)
+		}
+		if rl.IsKeyPressed(rl.KeyG) {
+			setTool(ToolDrive)
 		}
 		if rl.IsKeyPressed(rl.KeyD) {
 			debugMode = !debugMode
@@ -935,6 +976,23 @@ func main() {
 			zoomCameraToMouse(&camera, wheel)
 		}
 
+		if mode == ModeDriving && !playerCar.Active {
+			driveRestoreTarget = camera.Target
+			playerCar = newPlayerCarState(fromRLVec2(camera.Target))
+		} else if mode != ModeDriving && playerCar.Active {
+			playerCar.Active = false
+			playerCar.Speed = 0
+			world.ClearPlayerProxy()
+			camera.Target = driveRestoreTarget
+		}
+		if mode == ModeDriving {
+			updatePlayerCar(&playerCar, dt)
+			camera.Target = toRLVec2(playerCar.Position)
+			camera.Rotation = -playerCar.HeadingDeg
+		} else {
+			camera.Rotation = 0
+		}
+
 		mouseScreenRL := rl.GetMousePosition()
 		mouseScreen := fromRLVec2(mouseScreenRL)
 		mouseWorld := fromRLVec2(rl.GetScreenToWorld2D(mouseScreenRL, camera))
@@ -986,6 +1044,11 @@ func main() {
 		hoveredEnd := findNearbyEnd(splines, mouseWorld, snapRadius)
 		hoveredStart := findNearbyStart(splines, mouseWorld, snapRadius)
 		splineToolMouse, geometrySnap := applySplineToolSnap(mouseWorld, splines, camera.Zoom)
+		if mode == ModeDriving && playerCar.Active && !mouseOnToolbar && rl.IsMouseButtonPressed(rl.MouseButtonRight) && hoveredEnd.SplineID >= 0 {
+			playerCar.DestinationSplineID = hoveredEnd.SplineID
+			playerCar.DestinationPoint = hoveredEnd.Point
+			playerCar.HasDestination = true
+		}
 
 		frameProf.inputMS = sinceMS(inputStart)
 		vehicleCounts := simpkg.BuildVehicleCounts(cars)
@@ -1428,6 +1491,19 @@ func main() {
 		editorState.NextLightID = nextLightID
 		editorState.NextCycleID = nextCycleID
 		editorState.commit(&world)
+		if mode == ModeDriving && playerCar.Active {
+			world.UpdatePlayerProxy(simpkg.PlayerProxyFitInput{
+				Position:            playerCar.Position,
+				Heading:             playerForward(playerCar.HeadingDeg),
+				Speed:               playerCar.Speed,
+				Length:              playerCar.Length,
+				Width:               playerCar.Width,
+				CarID:               1_000_000_001,
+				Color:               NewColor(230, 86, 46, 255),
+				DestinationSplineID: playerCar.DestinationSplineID,
+			})
+		}
+		cars = world.Cars
 
 		if editorMutatedWorld {
 			worldRevision++
@@ -1573,6 +1649,12 @@ func main() {
 		if tool == ToolCut {
 			drawCutMode(stage, cutDraft, splines, mouseWorld, camera.Zoom)
 		}
+		if mode == ModeDriving && playerCar.HasDestination {
+			drawDrivingDestination(playerCar, camera.Zoom, viewRect)
+		}
+		if mode == ModeDriving && world.HasPlayerProxy {
+			drawPlayerProxyAttachment(world.PlayerProxyCar, splines, splineIndexByID, camera.Zoom, viewRect)
+		}
 		allSplineIndexByID := simpkg.BuildSplineIndexByID(allSplines)
 		drawCars(cars, allSplines, allSplineIndexByID, camera.Zoom, debugMode, viewRect)
 		if hitboxDebugMode {
@@ -1607,6 +1689,9 @@ func main() {
 			}
 		}
 		rl.EndMode2D()
+		if mode == ModeDriving && playerCar.Active {
+			drawPlayerCarScreen(playerCar, camera.Zoom)
+		}
 		drawDirectionWarningLabels(directionWarnings, camera, viewRect)
 
 		drawScaleBar(camera.Zoom)
@@ -3970,6 +4055,134 @@ func drawCars(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom fl
 	}
 }
 
+func newPlayerCarState(spawnPos Vec2) playerCarState {
+	return playerCarState{
+		Active:              true,
+		Position:            spawnPos,
+		HeadingDeg:          0,
+		Speed:               0,
+		Length:              4.6,
+		Width:               1.9,
+		Color:               NewColor(36, 142, 212, 255),
+		MaxForwardSpeed:     16.0,
+		MaxReverseSpeed:     4.0,
+		AccelMPS2:           4.25,
+		BrakeMPS2:           6.0,
+		CoastMPS2:           1.5,
+		BaseTurnDegPerS:     165.0,
+		DestinationSplineID: -1,
+	}
+}
+
+func playerForward(headingDeg float32) Vec2 {
+	rad := float64(headingDeg) * math.Pi / 180
+	return Vec2{
+		X: float32(math.Sin(rad)),
+		Y: -float32(math.Cos(rad)),
+	}
+}
+
+func updatePlayerCar(player *playerCarState, dt float32) {
+	if player == nil || !player.Active || dt <= 0 {
+		return
+	}
+
+	if rl.IsKeyDown(rl.KeyUp) {
+		player.Speed += player.AccelMPS2 * dt
+	} else if rl.IsKeyDown(rl.KeyDown) {
+		player.Speed -= player.BrakeMPS2 * dt
+	} else if player.Speed > 0 {
+		player.Speed = maxf(0, player.Speed-player.CoastMPS2*dt)
+	} else if player.Speed < 0 {
+		player.Speed = minf(0, player.Speed+player.CoastMPS2*dt)
+	}
+
+	player.Speed = clampf(player.Speed, -player.MaxReverseSpeed, player.MaxForwardSpeed)
+
+	turnInput := float32(0)
+	if rl.IsKeyDown(rl.KeyLeft) {
+		turnInput -= 1
+	}
+	if rl.IsKeyDown(rl.KeyRight) {
+		turnInput += 1
+	}
+	if turnInput != 0 {
+		turnScale := 1.0 / (1.0 + absf(player.Speed)*0.12)
+		turnScale = maxf(turnScale, 0.2)
+		if player.Speed < 0 {
+			turnInput = -turnInput
+		}
+		player.HeadingDeg += turnInput * player.BaseTurnDegPerS * turnScale * dt
+	}
+
+	player.Position = vecAdd(player.Position, vecScale(playerForward(player.HeadingDeg), player.Speed*dt))
+}
+
+func drawPlayerCarScreen(player playerCarState, zoom float32) {
+	if !player.Active {
+		return
+	}
+
+	center := NewVec2(float32(rl.GetScreenWidth())/2, float32(rl.GetScreenHeight())/2)
+	lengthPx := maxf(player.Length*zoom, 34)
+	widthPx := maxf(player.Width*zoom, 18)
+
+	bodyRect := rl.NewRectangle(center.X, center.Y, lengthPx, widthPx)
+	bodyOrigin := NewVec2(lengthPx/2, widthPx/2)
+	drawRectanglePro(bodyRect, bodyOrigin, -90, player.Color)
+
+	windowRect := rl.NewRectangle(center.X, center.Y-widthPx*0.02, lengthPx*0.54, widthPx*0.56)
+	windowOrigin := NewVec2(windowRect.Width/2, windowRect.Height/2)
+	drawRectanglePro(windowRect, windowOrigin, -90, NewColor(222, 238, 246, 230))
+
+	grilleRect := rl.NewRectangle(center.X, center.Y-lengthPx*0.28, lengthPx*0.12, widthPx*0.74)
+	grilleOrigin := NewVec2(grilleRect.Width/2, grilleRect.Height/2)
+	drawRectanglePro(grilleRect, grilleOrigin, -90, NewColor(26, 34, 38, 110))
+
+	lightOffsetX := widthPx * 0.26
+	lightOffsetY := lengthPx * 0.43
+	lightR := maxf(widthPx*0.08, 2.5)
+	drawCircleV(NewVec2(center.X-lightOffsetX, center.Y-lightOffsetY), lightR, NewColor(255, 245, 190, 255))
+	drawCircleV(NewVec2(center.X+lightOffsetX, center.Y-lightOffsetY), lightR, NewColor(255, 245, 190, 255))
+}
+
+func drawPlayerProxyAttachment(car Car, splines []Spline, splineIndexByID map[int]int, zoom float32, viewRect worldRect) {
+	splineIdx, ok := splineIndexByID[car.CurrentSplineID]
+	if !ok {
+		return
+	}
+	spline := splines[splineIdx]
+	if !splineVisibleInWorldRect(spline, viewRect) {
+		return
+	}
+
+	highlightColor := NewColor(255, 122, 68, 220)
+	drawSpline(spline, pixelsToWorld(zoom, 6), highlightColor)
+
+	anchorPos, _ := simpkg.SampleSplineAtDistance(spline, car.DistanceOnSpline)
+	if !worldRectContainsPoint(viewRect, anchorPos) {
+		return
+	}
+	rOuter := pixelsToWorld(zoom, 9)
+	rInner := pixelsToWorld(zoom, 4)
+	drawCircleV(anchorPos, rInner, NewColor(255, 244, 232, 255))
+	drawRing(anchorPos, rInner*1.15, rOuter, 0, 360, 24, highlightColor)
+}
+
+func drawDrivingDestination(player playerCarState, zoom float32, viewRect worldRect) {
+	if !player.HasDestination {
+		return
+	}
+	if !worldRectContainsPoint(viewRect, player.DestinationPoint) {
+		return
+	}
+	color := NewColor(60, 190, 90, 240)
+	rOuter := pixelsToWorld(zoom, 11)
+	rInner := pixelsToWorld(zoom, 4.5)
+	drawCircleV(player.DestinationPoint, rInner, NewColor(236, 255, 240, 255))
+	drawRing(player.DestinationPoint, rInner*1.2, rOuter, 0, 360, 24, color)
+}
+
 // drawCarHitboxes renders the multi-circle collision hitbox of every car.
 func drawCarHitboxes(cars []Car, splines []Spline, splineIndexByID map[int]int, viewRect worldRect) {
 	fill := NewColor(255, 80, 255, 50)
@@ -4333,6 +4546,8 @@ func modeStatusText(mode EditorMode, tool EditorTool, stage Stage, draft Draft, 
 		return "Left click: assign 1 (reset counter)   Right click on empty: next number   Right click on assigned: remove"
 	case ToolTrafficLight:
 		return "Left click on spline: add light to cycle   Right click on light: remove from cycle   Then press Create"
+	case ToolDrive:
+		return "Use arrow keys to drive. Right click a spline end to set the destination."
 	}
 	switch mode {
 	case ModeDraw:
@@ -4343,6 +4558,8 @@ func modeStatusText(mode EditorMode, tool EditorTool, stage Stage, draft Draft, 
 		return "Route tools"
 	case ModeTraffic:
 		return "Traffic tools"
+	case ModeDriving:
+		return "Driving"
 	default:
 		return ""
 	}
@@ -4358,6 +4575,8 @@ func modeName(mode EditorMode) string {
 		return "Route"
 	case ModeTraffic:
 		return "Traffic"
+	case ModeDriving:
+		return "Drive"
 	default:
 		return "Unknown"
 	}
@@ -4389,6 +4608,8 @@ func toolName(tool EditorTool) string {
 		return "Erase"
 	case ToolTrafficLight:
 		return "Traffic"
+	case ToolDrive:
+		return "Drive"
 	default:
 		return "Unknown"
 	}
@@ -4466,6 +4687,13 @@ func hudInfoLines(mode EditorMode, tool EditorTool, stage Stage, draft Draft, qu
 			"Traffic tool: left click a spline to add a light candidate to the current cycle, or open the cycle panel workflow and then create phases from the selected lights.",
 			"Right click a placed light removes it. The cycle panel is used to create, edit, preview, and assign per-phase light states and durations.",
 			"Escape backs out of the current traffic editing sub-step before it closes the overall cycle UI.",
+		)
+	case ToolDrive:
+		controls = append(controls,
+			"Driving mode: use the arrow keys to accelerate, brake, and steer the player car.",
+			"The camera follows the player, keeps the car centered, and rotates the world so the car always points toward the top of the screen.",
+			"Right click a spline end to set the current destination node for later route/path logic.",
+			"Leaving driving mode removes the player car and restores the normal editor camera orientation.",
 		)
 	default:
 		controls = append(controls, fmt.Sprintf("%s mode: use the toolbar or shortcuts to switch to a tool for editing.", modeName(mode)))
@@ -5088,13 +5316,30 @@ func mapBoolColor(condition bool, whenTrue, whenFalse Color) Color {
 	return whenFalse
 }
 
+func cameraScreenWorldBounds(camera rl.Camera2D) (minX, minY, maxX, maxY float32) {
+	screenW := float32(rl.GetScreenWidth())
+	screenH := float32(rl.GetScreenHeight())
+	corners := [4]rl.Vector2{
+		rl.NewVector2(0, 0),
+		rl.NewVector2(screenW, 0),
+		rl.NewVector2(0, screenH),
+		rl.NewVector2(screenW, screenH),
+	}
+	first := rl.GetScreenToWorld2D(corners[0], camera)
+	minX, maxX = first.X, first.X
+	minY, maxY = first.Y, first.Y
+	for i := 1; i < len(corners); i++ {
+		p := rl.GetScreenToWorld2D(corners[i], camera)
+		minX = minf(minX, p.X)
+		maxX = maxf(maxX, p.X)
+		minY = minf(minY, p.Y)
+		maxY = maxf(maxY, p.Y)
+	}
+	return minX, minY, maxX, maxY
+}
+
 func drawGrid(camera rl.Camera2D) {
-	topLeft := rl.GetScreenToWorld2D(rl.NewVector2(0, 0), camera)
-	bottomRight := rl.GetScreenToWorld2D(rl.NewVector2(float32(rl.GetScreenWidth()), float32(rl.GetScreenHeight())), camera)
-	minX := minf(topLeft.X, bottomRight.X)
-	maxX := maxf(topLeft.X, bottomRight.X)
-	minY := minf(topLeft.Y, bottomRight.Y)
-	maxY := maxf(topLeft.Y, bottomRight.Y)
+	minX, minY, maxX, maxY := cameraScreenWorldBounds(camera)
 	zoom := camera.Zoom
 
 	type level struct {
@@ -5131,12 +5376,7 @@ func drawGrid(camera rl.Camera2D) {
 }
 
 func drawAxes(camera rl.Camera2D) {
-	topLeft := rl.GetScreenToWorld2D(rl.NewVector2(0, 0), camera)
-	bottomRight := rl.GetScreenToWorld2D(rl.NewVector2(float32(rl.GetScreenWidth()), float32(rl.GetScreenHeight())), camera)
-	minX := minf(topLeft.X, bottomRight.X)
-	maxX := maxf(topLeft.X, bottomRight.X)
-	minY := minf(topLeft.Y, bottomRight.Y)
-	maxY := maxf(topLeft.Y, bottomRight.Y)
+	minX, minY, maxX, maxY := cameraScreenWorldBounds(camera)
 
 	axis := NewColor(180, 180, 185, 255)
 	drawLineV(NewVec2(0, minY), NewVec2(0, maxY), axis)
@@ -5422,13 +5662,12 @@ func pointInRect(p Vec2, r rl.Rectangle) bool {
 }
 
 func cameraWorldRect(camera rl.Camera2D, pad float32) worldRect {
-	topLeft := rl.GetScreenToWorld2D(rl.NewVector2(0, 0), camera)
-	bottomRight := rl.GetScreenToWorld2D(rl.NewVector2(float32(rl.GetScreenWidth()), float32(rl.GetScreenHeight())), camera)
+	minX, minY, maxX, maxY := cameraScreenWorldBounds(camera)
 	return worldRect{
-		MinX: minf(topLeft.X, bottomRight.X) - pad,
-		MinY: minf(topLeft.Y, bottomRight.Y) - pad,
-		MaxX: maxf(topLeft.X, bottomRight.X) + pad,
-		MaxY: maxf(topLeft.Y, bottomRight.Y) + pad,
+		MinX: minX - pad,
+		MinY: minY - pad,
+		MaxX: maxX + pad,
+		MaxY: maxY + pad,
 	}
 }
 

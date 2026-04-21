@@ -48,23 +48,34 @@ split because topology is stable across many frames and the C side caches it.
 Per frame, `(*World).Step(dt)` does, in order:
 
 1. `BuildVehicleCounts` → `newRoadGraphFromTopology` (uses the cached
-   permanent topology; see below).
+   permanent topology; see below). Note: `BuildVehicleCounts` ignores
+   `CarControlExternal`, so the player proxy does not contribute to route-cost
+   congestion weighting yet.
 2. `UpdateRouteVisualsWithGraph` — only every 0.5s, recomputes each route's
    precomputed path via the graph's per-destination Dijkstra tree cache.
-3. `computeLaneChanges` — may append temporary bridge splines to
-   `LaneChangeSplines` and mutate each car's `LaneChanging` / `AfterSplineID`.
+3. `computeLaneChanges` — runs against the full `world.Cars` snapshot so AI
+   cars can treat external cars as occupancy, but it skips mutating
+   `CarControlExternal` cars. May append temporary bridge splines to
+   `LaneChangeSplines` and mutate each AI car's `LaneChanging` /
+   `AfterSplineID`.
 4. Rebuild `allGraph` = permanent topology **+** lane-change bridges. This is
    the graph passed to the braking kernel and pathfinding for the rest of the
    step.
 5. In parallel (two goroutines):
-   - `computeBrakingDecisionsC` → (brake flags, hold-speed flags, debug links).
-   - `computeFollowingSpeedCaps` → per-car soft speed cap from the car ahead.
-6. `updateCars` — integrates each car forward, applies speed caps, handles
-   spline transitions, bus-stop dwell. Parallel fast path + sequential
-   transition resolver.
+   - `computeBrakingDecisionsC` → (brake flags, hold-speed flags, debug links)
+     for the full car slice, including external cars.
+   - `computeFollowingSpeedCaps` → per-car soft speed cap from the car ahead,
+     also for the full car slice.
+6. Split by `Car.ControlMode`. Project the read-side outputs back onto the AI
+   subset only, then `updateCars` integrates only those AI cars forward,
+   applies speed caps, handles spline transitions, bus-stop dwell. Parallel
+   fast path + sequential transition resolver.
 7. `gcLaneChangeSplines` drops bridges nobody references.
-8. `updateRouteSpawning` — Poisson-ish spawns (`randomizedSpawnDelay`).
-9. `UpdateTrafficCycles` — advances light phases.
+8. `updateRouteSpawning` — Poisson-ish spawns (`randomizedSpawnDelay`). Spawn
+   blocking sees external cars too, so the player proxy occupies space for
+   spawn checks.
+9. Merge AI cars + external cars back into `world.Cars`.
+10. `UpdateTrafficCycles` — advances light phases.
 
 Everything else (debug blame links, profile counters) is book-keeping.
 
@@ -201,6 +212,31 @@ that rear point with the same model. This is why the prediction code
 carries `simRearPos` and `simTrailerRearPos` as mutable state separate
 from the spline-distance position.
 
+### Driving mode / player proxy
+
+The human-driven car in `main.go` is **not** a `sim.Car`. Driving mode keeps a
+screen-centered gameplay car with its own physics and camera behavior, then
+updates a spline-bound proxy in `sim` via `World.UpdatePlayerProxy`.
+
+That proxy:
+- lives in `world.Cars`
+- has `ControlMode = CarControlExternal`
+- is mirrored in `World.HasPlayerProxy` / `PlayerProxyCar` /
+  `PlayerProxyAttach` for debug rendering and attachment state
+- is inserted / updated after `editorState.commit(&world)` in `main.go`, so it
+  does not get overwritten by editor-state synchronization
+
+Read-side AI logic should see the proxy. Write-side AI logic must not move it.
+That split is enforced in `World.Step` by running lane-change / braking /
+following against the full car slice, then updating only the AI subset.
+
+The proxy fitter lives in `sim/player_proxy.go`. Important details:
+- fitting is spline-centric with hysteresis over the previous attachment
+- the player center is shifted forward to the sim's front-pivot reference
+  before projecting, otherwise the proxy lags behind the rendered player car
+- the selected driving-mode destination is currently stored for future path
+  prediction work, but it is **not** yet used to bias proxy spline fitting
+
 ## Save format
 
 JSON, defined by `SavedSplineFile` / `SavedSpline` / `SavedRoute` /
@@ -211,6 +247,11 @@ may omit newer fields (e.g. `bus_only`, `lane_preference`,
 `LoadWorld` — don't require it in existing saves. The example and test
 JSONs under `examples/` and `tests/` are committed and used by humans;
 don't regenerate them unless asked.
+
+Runtime-only state is intentionally excluded from saves:
+- `LaneChangeSplines`
+- debug/profile fields
+- the player proxy / any `CarControlExternal` cars
 
 ## Gotchas / rules
 

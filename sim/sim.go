@@ -24,6 +24,13 @@ const (
 	VehicleBus
 )
 
+type CarControlMode uint8
+
+const (
+	CarControlAI CarControlMode = iota
+	CarControlExternal
+)
+
 const (
 	simSamples = 96
 
@@ -149,8 +156,9 @@ type Trailer struct {
 }
 
 type Car struct {
-	ID      int
-	RouteID int
+	ID          int
+	RouteID     int
+	ControlMode CarControlMode
 
 	CurrentSplineID      int
 	DestinationSplineID  int
@@ -184,6 +192,84 @@ type Car struct {
 	BusStopDuration    float32
 
 	Trailer Trailer
+}
+
+type carControlSplit struct {
+	simCars               []Car
+	simSourceIndices      []int
+	externalCars          []Car
+	externalSourceIndices []int
+}
+
+func splitCarsByControlMode(cars []Car) carControlSplit {
+	if len(cars) == 0 {
+		return carControlSplit{}
+	}
+	split := carControlSplit{
+		simCars:               make([]Car, 0, len(cars)),
+		simSourceIndices:      make([]int, 0, len(cars)),
+		externalCars:          make([]Car, 0, 1),
+		externalSourceIndices: make([]int, 0, 1),
+	}
+	for i, car := range cars {
+		if car.ControlMode == CarControlExternal {
+			split.externalCars = append(split.externalCars, car)
+			split.externalSourceIndices = append(split.externalSourceIndices, i)
+			continue
+		}
+		split.simCars = append(split.simCars, car)
+		split.simSourceIndices = append(split.simSourceIndices, i)
+	}
+	return split
+}
+
+func projectBoolSlice(values []bool, indices []int) []bool {
+	if len(indices) == 0 {
+		return nil
+	}
+	out := make([]bool, len(indices))
+	for i, idx := range indices {
+		if idx >= 0 && idx < len(values) {
+			out[i] = values[idx]
+		}
+	}
+	return out
+}
+
+func projectFloat32Slice(values []float32, indices []int) []float32 {
+	if len(indices) == 0 {
+		return nil
+	}
+	out := make([]float32, len(indices))
+	for i, idx := range indices {
+		if idx >= 0 && idx < len(values) {
+			out[i] = values[idx]
+		}
+	}
+	return out
+}
+
+func buildFullCarRemap(total int, simSourceIndices []int, simIndexRemap []int, externalSourceIndices []int, simCount int) []int {
+	if total == 0 {
+		return nil
+	}
+	remap := make([]int, total)
+	for i := range remap {
+		remap[i] = -1
+	}
+	for simIdx, sourceIdx := range simSourceIndices {
+		if sourceIdx < 0 || sourceIdx >= len(remap) || simIdx < 0 || simIdx >= len(simIndexRemap) {
+			continue
+		}
+		remap[sourceIdx] = simIndexRemap[simIdx]
+	}
+	for extIdx, sourceIdx := range externalSourceIndices {
+		if sourceIdx < 0 || sourceIdx >= len(remap) {
+			continue
+		}
+		remap[sourceIdx] = simCount + extIdx
+	}
+	return remap
 }
 
 type TrajectorySample struct {
@@ -511,6 +597,9 @@ type RuntimeState struct {
 	LaneChangeSplines []Spline
 	Cars              []Car
 	NextCarID         int
+	HasPlayerProxy    bool
+	PlayerProxyCar    Car
+	PlayerProxyAttach PlayerProxyAttachment
 
 	RouteVisualsTimer float32
 
@@ -706,6 +795,9 @@ func (w *World) RefreshRoutes() {
 func (w *World) ResetTransientState() {
 	w.Cars = w.Cars[:0]
 	w.LaneChangeSplines = w.LaneChangeSplines[:0]
+	w.HasPlayerProxy = false
+	w.PlayerProxyCar = Car{}
+	w.PlayerProxyAttach = PlayerProxyAttachment{}
 	w.DebugBlameLinks = nil
 	w.HoldBlameLinks = nil
 	w.DebugCandidateLinks = nil
@@ -939,9 +1031,10 @@ func (w *World) Step(dt float32) {
 	w.BrakingProfile = BrakingProfile{}
 	w.FollowingProfile = FollowingProfile{}
 	w.UpdateCarsProfile = UpdateCarsProfile{}
+	reactionCars := append([]Car(nil), w.Cars...)
 
 	graphStart := time.Now()
-	vehicleCounts := BuildVehicleCounts(w.Cars)
+	vehicleCounts := BuildVehicleCounts(reactionCars)
 	permanentTopology := w.permanentRoadGraphTopology()
 	baseGraph := newRoadGraphFromTopology(permanentTopology, vehicleCounts)
 	w.GraphBuildMS += sinceMS(graphStart)
@@ -955,14 +1048,14 @@ func (w *World) Step(dt float32) {
 	}
 
 	laneChangesStart := time.Now()
-	w.LaneChangeSplines, w.Cars = computeLaneChanges(w.Cars, w.Splines, w.LaneChangeSplines, &w.NextSplineID, baseGraph, dt)
+	w.LaneChangeSplines, reactionCars = computeLaneChanges(reactionCars, w.Splines, w.LaneChangeSplines, &w.NextSplineID, baseGraph, dt)
 	w.LaneChangesMS = sinceMS(laneChangesStart)
 
 	graphStart = time.Now()
 	allGraph := buildMergedRoadGraphFromTopology(permanentTopology, w.LaneChangeSplines, vehicleCounts)
 	w.GraphBuildMS += sinceMS(graphStart)
 
-	debugSelectedCar := findCarIndexByID(w.Cars, w.DebugSelectedCarID)
+	debugSelectedCar := findCarIndexByID(reactionCars, w.DebugSelectedCarID)
 	var brakingDecisions, holdSpeedDecisions []bool
 	var debugBlameLinks, holdBlameLinks, candidateLinks []DebugBlameLink
 	var brakingProfile BrakingProfile
@@ -975,13 +1068,13 @@ func (w *World) Step(dt float32) {
 	go func() {
 		defer wgBrakeFollow.Done()
 		brakingStart := time.Now()
-		brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks, candidateLinks, brakingProfile = computeBrakingDecisionsC(w.Cars, allGraph, debugSelectedCar, w.DebugSelectedCarMode)
+		brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks, candidateLinks, brakingProfile = computeBrakingDecisionsC(reactionCars, allGraph, debugSelectedCar, w.DebugSelectedCarMode)
 		brakingMS = sinceMS(brakingStart)
 	}()
 	go func() {
 		defer wgBrakeFollow.Done()
 		followStart := time.Now()
-		followCaps, followingProfile = computeFollowingSpeedCaps(w.Cars, allGraph)
+		followCaps, followingProfile = computeFollowingSpeedCaps(reactionCars, allGraph)
 		followMS = sinceMS(followStart)
 	}()
 	wgBrakeFollow.Wait()
@@ -990,17 +1083,31 @@ func (w *World) Step(dt float32) {
 	w.FollowMS = followMS
 	w.FollowingProfile = followingProfile
 
+	split := splitCarsByControlMode(reactionCars)
+	simBrakingDecisions := projectBoolSlice(brakingDecisions, split.simSourceIndices)
+	simHoldSpeedDecisions := projectBoolSlice(holdSpeedDecisions, split.simSourceIndices)
+	simFollowCaps := projectFloat32Slice(followCaps, split.simSourceIndices)
+
 	updateCarsStart := time.Now()
+	simCars := split.simCars
 	var indexRemap []int
-	w.Cars, indexRemap, w.UpdateCarsProfile = updateCars(w.Cars, w.Routes, allGraph, brakingDecisions, holdSpeedDecisions, followCaps, w.TrafficLights, w.TrafficCycles, dt)
-	w.LaneChangeSplines = gcLaneChangeSplines(w.LaneChangeSplines, w.Cars)
-	w.Routes, w.Cars = updateRouteSpawning(w.Routes, w.Cars, w.Splines, &w.NextCarID, dt)
+	simCars, indexRemap, w.UpdateCarsProfile = updateCars(split.simCars, w.Routes, allGraph, simBrakingDecisions, simHoldSpeedDecisions, simFollowCaps, w.TrafficLights, w.TrafficCycles, dt)
+	w.LaneChangeSplines = gcLaneChangeSplines(w.LaneChangeSplines, simCars)
+	carsForSpawn := make([]Car, 0, len(simCars)+len(split.externalCars))
+	carsForSpawn = append(carsForSpawn, simCars...)
+	carsForSpawn = append(carsForSpawn, split.externalCars...)
+	w.Routes, carsForSpawn = updateRouteSpawning(w.Routes, carsForSpawn, w.Splines, &w.NextCarID, dt)
+	postSpawnSplit := splitCarsByControlMode(carsForSpawn)
+	simCars = postSpawnSplit.simCars
+	externalCars := postSpawnSplit.externalCars
 	w.TrafficCycles = UpdateTrafficCycles(w.TrafficCycles, dt)
 	w.UpdateCarsMS = sinceMS(updateCarsStart)
+	w.Cars = append(simCars, externalCars...)
 
-	w.DebugBlameLinks = remapBlameLinks(debugBlameLinks, indexRemap)
-	w.HoldBlameLinks = remapBlameLinks(holdBlameLinks, indexRemap)
-	w.DebugCandidateLinks = remapBlameLinks(candidateLinks, indexRemap)
+	fullIndexRemap := buildFullCarRemap(len(reactionCars), split.simSourceIndices, indexRemap, split.externalSourceIndices, len(simCars))
+	w.DebugBlameLinks = remapBlameLinks(debugBlameLinks, fullIndexRemap)
+	w.HoldBlameLinks = remapBlameLinks(holdBlameLinks, fullIndexRemap)
+	w.DebugCandidateLinks = remapBlameLinks(candidateLinks, fullIndexRemap)
 	if w.DebugSelectedCarID >= 0 && findCarIndexByID(w.Cars, w.DebugSelectedCarID) < 0 {
 		w.DebugSelectedCarID = -1
 		w.DebugSelectedCarMode = 0
@@ -1135,6 +1242,9 @@ func (w *World) Save(path string) error {
 		})
 	}
 	for _, car := range w.Cars {
+		if car.ControlMode == CarControlExternal {
+			continue
+		}
 		saved.Cars = append(saved.Cars, SavedCar{
 			ID:                   car.ID,
 			RouteID:              car.RouteID,
@@ -3507,16 +3617,17 @@ func buildLaneChangeBridge(car *Car, destSplineID int, splines []Spline, splineI
 
 // computeLaneChanges decides, for each car not already mid-change, whether
 // to start a new lane change. Three triggers, in this order:
-//   1. DesiredLaneSplineID set (forced — usually because pathfinding says
-//      the only route to the destination runs through a coupled sibling
-//      lane). If the forced deadline has arrived, the bridge is built even
-//      if it's geometrically tight.
-//   2. Preference-based: every preferenceChangeCooldownS seconds, look at
-//      HardCoupled+SoftCoupled siblings with a lower LanePreference and
-//      consider switching if the path cost penalty is bounded.
-//   3. Overtake: if the car has been stuck below its preferred speed for
-//      longer than overtakeSlowThresholdS behind a slower leader, try to
-//      jump to a sibling lane.
+//  1. DesiredLaneSplineID set (forced — usually because pathfinding says
+//     the only route to the destination runs through a coupled sibling
+//     lane). If the forced deadline has arrived, the bridge is built even
+//     if it's geometrically tight.
+//  2. Preference-based: every preferenceChangeCooldownS seconds, look at
+//     HardCoupled+SoftCoupled siblings with a lower LanePreference and
+//     consider switching if the path cost penalty is bounded.
+//  3. Overtake: if the car has been stuck below its preferred speed for
+//     longer than overtakeSlowThresholdS behind a slower leader, try to
+//     jump to a sibling lane.
+//
 // Every candidate goes through laneChangeLandingDist + isLaneChangeLandingSafe
 // before a bridge is synthesised.
 func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int, graph *RoadGraph, dt float32) ([]Spline, []Car) {
@@ -3533,6 +3644,9 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 
 	for i := range cars {
 		car := &cars[i]
+		if car.ControlMode == CarControlExternal {
+			continue
+		}
 		if car.LaneChanging {
 			continue
 		}
@@ -3975,6 +4089,9 @@ func computeAnticipatoryTargetSpeed(car Car, currentSpline *Spline, graph *RoadG
 func BuildVehicleCounts(cars []Car) map[int]int {
 	counts := make(map[int]int, len(cars))
 	for _, car := range cars {
+		if car.ControlMode == CarControlExternal {
+			continue
+		}
 		counts[car.CurrentSplineID]++
 	}
 	return counts
