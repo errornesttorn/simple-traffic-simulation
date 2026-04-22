@@ -86,6 +86,40 @@ const (
 	wheelbaseFrac  float32 = rearPivotFrac - frontPivotFrac
 )
 
+const (
+	pedestrianSpawnIntervalS          float32 = 32.0
+	pedestrianSpawnJitterFrac         float32 = 0.25
+	pedestrianSpawnRetryDelayS        float32 = 0.75
+	pedestrianSpawnInsetM             float32 = 0.35
+	pedestrianSpeedMinMPS             float32 = 1.1
+	pedestrianSpeedMaxMPS             float32 = 1.7
+	pedestrianMinSpeedFactor          float32 = 0.35
+	pedestrianRadiusM                 float32 = 0.28
+	pedestrianPreferredOffsetM        float32 = 0.75
+	pedestrianSideBiasM               float32 = 0.22
+	pedestrianHeadOnLookaheadM        float32 = 1.8
+	pedestrianSoftFollowDistM         float32 = 1.25
+	pedestrianSpawnClearanceM         float32 = 0.9
+	pedestrianLateralResponseRate     float32 = 3.5
+	pedestrianSpeedResponseRate       float32 = 4.0
+	pedestrianHeadOnSlowdownStrength  float32 = 0.25
+	pedestrianHeadOnExtraOffsetM      float32 = 0.35
+	pedestrianSameDirectionSlowFactor float32 = 0.65
+	pedestrianTurnLengthFloorM        float32 = 0.4
+	pedestrianTurnSamples                     = 12
+	// pedestrianCrossingBlockRadiusM is how close a pedestrian must be (along
+	// their path, either side of the crossing) for the crossing to act like a
+	// red traffic light to cars on the intersecting spline.
+	pedestrianCrossingBlockRadiusM float32 = 5.0
+	// pedestrianCrossingCarRadiusM is how close a car must be to the crossing
+	// (along its spline) to count as occupying it from a pedestrian's POV.
+	pedestrianCrossingCarRadiusM float32 = 3.0
+	// pedestrianCrossingStopBufferM is how far (along the pedestrian path) a
+	// pedestrian stops in front of the crossing when waiting. Kept smaller than
+	// stopFrontGapM so cars stopping at the crossing stay behind the pedestrian.
+	pedestrianCrossingStopBufferM float32 = 2.0
+)
+
 type Vec2 struct {
 	X float32 `json:"x"`
 	Y float32 `json:"y"`
@@ -582,10 +616,11 @@ type TrafficCycle struct {
 }
 
 type TopologyState struct {
-	Splines       []Spline
-	Routes        []Route
-	TrafficLights []TrafficLight
-	TrafficCycles []TrafficCycle
+	Splines         []Spline
+	Routes          []Route
+	TrafficLights   []TrafficLight
+	TrafficCycles   []TrafficCycle
+	PedestrianPaths []PedestrianPath
 
 	NextSplineID int
 	NextRouteID  int
@@ -593,10 +628,58 @@ type TopologyState struct {
 	NextCycleID  int
 }
 
+// PedestrianPath is a straight walking segment between two endpoints.
+// Width is fixed (see PedestrianPathWidthM); no per-path properties yet.
+type PedestrianPath struct {
+	P0 Vec2
+	P1 Vec2
+}
+
+const PedestrianPathWidthM float32 = 4.0
+
+// pedestrianCrossing is a point where a pedestrian path meets a car spline.
+// Distances are arc-length: along the pedestrian path from P0, and along the
+// spline from its start.
+type pedestrianCrossing struct {
+	SplineID     int
+	DistOnSpline float32
+	PathIndex    int
+	DistOnPath   float32
+}
+
+type Pedestrian struct {
+	ID            int
+	PathIndex     int
+	Distance      float32
+	Forward       bool
+	Speed         float32
+	BaseSpeed     float32
+	Radius        float32
+	LateralOffset float32
+	SideBias      float32
+
+	TransitionActive      bool
+	TransitionDistance    float32
+	TransitionLength      float32
+	TransitionP0          Vec2
+	TransitionP1          Vec2
+	TransitionP2          Vec2
+	TransitionNextPath    int
+	TransitionNextForward bool
+	TransitionEndOffset   float32
+}
+
+type pedestrianSpawnKey struct {
+	PathIndex int
+	Forward   bool
+}
+
 type RuntimeState struct {
 	LaneChangeSplines []Spline
 	Cars              []Car
 	NextCarID         int
+	Pedestrians       []Pedestrian
+	NextPedestrianID  int
 	HasPlayerProxy    bool
 	PlayerProxyCar    Car
 	PlayerProxyAttach PlayerProxyAttachment
@@ -624,6 +707,8 @@ type RuntimeState struct {
 	UpdateCarsMS   float64
 	StepMS         float64
 
+	PedestrianSpawnTimers map[pedestrianSpawnKey]float32
+
 	permanentGraphTopology    *roadGraphTopology
 	permanentGraphTopologyKey uint64
 	permanentGraphSplineAddr  uintptr
@@ -638,20 +723,24 @@ type World struct {
 func NewWorld() World {
 	return World{
 		TopologyState: TopologyState{
-			Splines:       make([]Spline, 0, 128),
-			Routes:        make([]Route, 0, 32),
-			TrafficLights: make([]TrafficLight, 0),
-			TrafficCycles: make([]TrafficCycle, 0),
-			NextSplineID:  1,
-			NextRouteID:   1,
-			NextLightID:   1,
-			NextCycleID:   1,
+			Splines:         make([]Spline, 0, 128),
+			Routes:          make([]Route, 0, 32),
+			TrafficLights:   make([]TrafficLight, 0),
+			TrafficCycles:   make([]TrafficCycle, 0),
+			PedestrianPaths: make([]PedestrianPath, 0, 64),
+			NextSplineID:    1,
+			NextRouteID:     1,
+			NextLightID:     1,
+			NextCycleID:     1,
 		},
 		RuntimeState: RuntimeState{
-			LaneChangeSplines:  make([]Spline, 0, 32),
-			Cars:               make([]Car, 0, 256),
-			NextCarID:          1,
-			DebugSelectedCarID: -1,
+			LaneChangeSplines:     make([]Spline, 0, 32),
+			Cars:                  make([]Car, 0, 256),
+			NextCarID:             1,
+			Pedestrians:           make([]Pedestrian, 0, 64),
+			NextPedestrianID:      1,
+			DebugSelectedCarID:    -1,
+			PedestrianSpawnTimers: make(map[pedestrianSpawnKey]float32),
 		},
 	}
 }
@@ -734,6 +823,17 @@ func cloneDebugBlameLinks(src []DebugBlameLink) []DebugBlameLink {
 	return append([]DebugBlameLink(nil), src...)
 }
 
+func clonePedestrianSpawnTimers(src map[pedestrianSpawnKey]float32) map[pedestrianSpawnKey]float32 {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[pedestrianSpawnKey]float32, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
 func (w World) Clone() World {
 	clone := w
 	clone.TopologyState = w.TopologyState
@@ -752,9 +852,20 @@ func (w World) Clone() World {
 		clone.TrafficLights = nil
 	}
 	clone.TrafficCycles = cloneTrafficCycles(w.TrafficCycles)
+	if len(w.PedestrianPaths) > 0 {
+		clone.PedestrianPaths = append([]PedestrianPath(nil), w.PedestrianPaths...)
+	} else {
+		clone.PedestrianPaths = nil
+	}
+	if len(w.Pedestrians) > 0 {
+		clone.Pedestrians = append([]Pedestrian(nil), w.Pedestrians...)
+	} else {
+		clone.Pedestrians = nil
+	}
 	clone.DebugBlameLinks = cloneDebugBlameLinks(w.DebugBlameLinks)
 	clone.HoldBlameLinks = cloneDebugBlameLinks(w.HoldBlameLinks)
 	clone.DebugCandidateLinks = cloneDebugBlameLinks(w.DebugCandidateLinks)
+	clone.PedestrianSpawnTimers = clonePedestrianSpawnTimers(w.PedestrianSpawnTimers)
 	clone.permanentGraphTopology = nil
 	clone.permanentGraphTopologyKey = 0
 	clone.permanentGraphSplineAddr = 0
@@ -795,6 +906,7 @@ func (w *World) RefreshRoutes() {
 func (w *World) ResetTransientState() {
 	w.Cars = w.Cars[:0]
 	w.LaneChangeSplines = w.LaneChangeSplines[:0]
+	w.ResetPedestrianRuntime()
 	w.HasPlayerProxy = false
 	w.PlayerProxyCar = Car{}
 	w.PlayerProxyAttach = PlayerProxyAttachment{}
@@ -803,6 +915,16 @@ func (w *World) ResetTransientState() {
 	w.DebugCandidateLinks = nil
 	w.DebugSelectedCarID = -1
 	w.DebugSelectedCarMode = 0
+}
+
+func (w *World) ResetPedestrianRuntime() {
+	w.Pedestrians = w.Pedestrians[:0]
+	w.NextPedestrianID = 1
+	if w.PedestrianSpawnTimers == nil {
+		w.PedestrianSpawnTimers = make(map[pedestrianSpawnKey]float32)
+	} else {
+		clear(w.PedestrianSpawnTimers)
+	}
 }
 
 func findCarIndexByID(cars []Car, id int) int {
@@ -1088,10 +1210,13 @@ func (w *World) Step(dt float32) {
 	simHoldSpeedDecisions := projectBoolSlice(holdSpeedDecisions, split.simSourceIndices)
 	simFollowCaps := projectFloat32Slice(followCaps, split.simSourceIndices)
 
+	pedestrianCrossings := computePedestrianCrossings(w.PedestrianPaths, w.Splines)
+	pedestrianBlockedBySpline := buildPedestrianBlockedSplineDists(pedestrianCrossings, w.Pedestrians)
+
 	updateCarsStart := time.Now()
 	simCars := split.simCars
 	var indexRemap []int
-	simCars, indexRemap, w.UpdateCarsProfile = updateCars(split.simCars, w.Routes, allGraph, simBrakingDecisions, simHoldSpeedDecisions, simFollowCaps, w.TrafficLights, w.TrafficCycles, dt)
+	simCars, indexRemap, w.UpdateCarsProfile = updateCars(split.simCars, w.Routes, allGraph, simBrakingDecisions, simHoldSpeedDecisions, simFollowCaps, w.TrafficLights, w.TrafficCycles, pedestrianBlockedBySpline, dt)
 	w.LaneChangeSplines = gcLaneChangeSplines(w.LaneChangeSplines, simCars)
 	carsForSpawn := make([]Car, 0, len(simCars)+len(split.externalCars))
 	carsForSpawn = append(carsForSpawn, simCars...)
@@ -1101,6 +1226,10 @@ func (w *World) Step(dt float32) {
 	simCars = postSpawnSplit.simCars
 	externalCars := postSpawnSplit.externalCars
 	w.TrafficCycles = UpdateTrafficCycles(w.TrafficCycles, dt)
+	pedestrianCars := make([]Car, 0, len(simCars)+len(externalCars))
+	pedestrianCars = append(pedestrianCars, simCars...)
+	pedestrianCars = append(pedestrianCars, externalCars...)
+	w.Pedestrians, w.PedestrianSpawnTimers = updatePedestrians(w.Pedestrians, w.PedestrianPaths, &w.NextPedestrianID, w.PedestrianSpawnTimers, dt, pedestrianCrossings, pedestrianCars)
 	w.UpdateCarsMS = sinceMS(updateCarsStart)
 	w.Cars = append(simCars, externalCars...)
 
@@ -1119,12 +1248,704 @@ func (w *World) Step(dt float32) {
 	w.StepMS = sinceMS(stepStart)
 }
 
+type pedestrianRuntimePath struct {
+	Valid  bool
+	Index  int
+	P0     Vec2
+	P1     Vec2
+	Node0  NodeKey
+	Node1  NodeKey
+	Length float32
+	Dir    Vec2
+	Normal Vec2
+}
+
+type pedestrianTopology struct {
+	paths          []pedestrianRuntimePath
+	neighborsByKey map[NodeKey][]int
+	deadEndSources []pedestrianSpawnSource
+}
+
+type pedestrianSpawnSource struct {
+	key       pedestrianSpawnKey
+	pathIndex int
+	forward   bool
+}
+
+func buildPedestrianTopology(paths []PedestrianPath) pedestrianTopology {
+	topology := pedestrianTopology{
+		paths:          make([]pedestrianRuntimePath, len(paths)),
+		neighborsByKey: make(map[NodeKey][]int),
+	}
+	for i, path := range paths {
+		diff := vecSub(path.P1, path.P0)
+		lengthSq := vectorLengthSq(diff)
+		if lengthSq <= 1e-6 {
+			continue
+		}
+		length := sqrtf(lengthSq)
+		dir := vecScale(diff, 1/length)
+		node0 := nodeKeyFromVec2(path.P0)
+		node1 := nodeKeyFromVec2(path.P1)
+		topology.paths[i] = pedestrianRuntimePath{
+			Valid:  true,
+			Index:  i,
+			P0:     path.P0,
+			P1:     path.P1,
+			Node0:  node0,
+			Node1:  node1,
+			Length: length,
+			Dir:    dir,
+			Normal: NewVec2(-dir.Y, dir.X),
+		}
+		topology.neighborsByKey[node0] = append(topology.neighborsByKey[node0], i)
+		topology.neighborsByKey[node1] = append(topology.neighborsByKey[node1], i)
+	}
+	for key, edges := range topology.neighborsByKey {
+		if len(edges) != 1 {
+			continue
+		}
+		path := topology.paths[edges[0]]
+		if !path.Valid {
+			continue
+		}
+		forward := path.Node0 == key
+		topology.deadEndSources = append(topology.deadEndSources, pedestrianSpawnSource{
+			key: pedestrianSpawnKey{
+				PathIndex: path.Index,
+				Forward:   forward,
+			},
+			pathIndex: path.Index,
+			forward:   forward,
+		})
+	}
+	return topology
+}
+
+func preferredPedestrianOffset(forward bool, sideBias float32) float32 {
+	base := pedestrianPreferredOffsetM
+	if !forward {
+		base = -base
+	}
+	return base + sideBias
+}
+
+func pedestrianCanonicalDistance(path pedestrianRuntimePath, ped Pedestrian) float32 {
+	if ped.Forward {
+		return ped.Distance
+	}
+	return path.Length - ped.Distance
+}
+
+func pedestrianPoseOnRuntimePath(path pedestrianRuntimePath, ped Pedestrian) (Vec2, Vec2) {
+	dist := clampf(ped.Distance, 0, path.Length)
+	var pos, heading Vec2
+	if ped.Forward {
+		pos = vecAdd(path.P0, vecScale(path.Dir, dist))
+		heading = path.Dir
+	} else {
+		pos = vecSub(path.P1, vecScale(path.Dir, dist))
+		heading = vecScale(path.Dir, -1)
+	}
+	return vecAdd(pos, vecScale(path.Normal, ped.LateralOffset)), heading
+}
+
+func quadraticBezierPoint(p0, p1, p2 Vec2, t float32) Vec2 {
+	u := 1 - t
+	return Vec2{
+		X: u*u*p0.X + 2*u*t*p1.X + t*t*p2.X,
+		Y: u*u*p0.Y + 2*u*t*p1.Y + t*t*p2.Y,
+	}
+}
+
+func quadraticBezierTangent(p0, p1, p2 Vec2, t float32) Vec2 {
+	u := 1 - t
+	return normalize(Vec2{
+		X: 2*u*(p1.X-p0.X) + 2*t*(p2.X-p1.X),
+		Y: 2*u*(p1.Y-p0.Y) + 2*t*(p2.Y-p1.Y),
+	})
+}
+
+func quadraticBezierLength(p0, p1, p2 Vec2) float32 {
+	total := float32(0)
+	prev := p0
+	for i := 1; i <= pedestrianTurnSamples; i++ {
+		t := float32(i) / float32(pedestrianTurnSamples)
+		pt := quadraticBezierPoint(p0, p1, p2, t)
+		total += sqrtf(distSq(prev, pt))
+		prev = pt
+	}
+	return maxf(total, pedestrianTurnLengthFloorM)
+}
+
+func pedestrianTransitionPose(ped Pedestrian) (Vec2, Vec2) {
+	if !ped.TransitionActive || ped.TransitionLength <= 1e-6 {
+		return ped.TransitionP2, quadraticBezierTangent(ped.TransitionP0, ped.TransitionP1, ped.TransitionP2, 1)
+	}
+	t := clampf(ped.TransitionDistance/ped.TransitionLength, 0, 1)
+	return quadraticBezierPoint(ped.TransitionP0, ped.TransitionP1, ped.TransitionP2, t),
+		quadraticBezierTangent(ped.TransitionP0, ped.TransitionP1, ped.TransitionP2, t)
+}
+
+func pedestrianCurrentPose(path pedestrianRuntimePath, ped Pedestrian) (Vec2, Vec2) {
+	if ped.TransitionActive {
+		return pedestrianTransitionPose(ped)
+	}
+	return pedestrianPoseOnRuntimePath(path, ped)
+}
+
+func buildPedestrianTurn(path pedestrianRuntimePath, ped Pedestrian, nextPath pedestrianRuntimePath, nextForward bool) Pedestrian {
+	nodeCenter := path.P1
+	if !ped.Forward {
+		nodeCenter = path.P0
+	}
+	exitPos, _ := pedestrianPoseOnRuntimePath(path, Pedestrian{
+		Distance:      path.Length,
+		Forward:       ped.Forward,
+		LateralOffset: ped.LateralOffset,
+	})
+	entryOffset := preferredPedestrianOffset(nextForward, ped.SideBias)
+	entryPos, _ := pedestrianPoseOnRuntimePath(nextPath, Pedestrian{
+		Distance:      0,
+		Forward:       nextForward,
+		LateralOffset: entryOffset,
+	})
+	ped.TransitionActive = true
+	ped.TransitionDistance = 0
+	ped.TransitionP0 = exitPos
+	ped.TransitionP1 = nodeCenter
+	ped.TransitionP2 = entryPos
+	ped.TransitionLength = quadraticBezierLength(ped.TransitionP0, ped.TransitionP1, ped.TransitionP2)
+	ped.TransitionNextPath = nextPath.Index
+	ped.TransitionNextForward = nextForward
+	ped.TransitionEndOffset = entryOffset
+	return ped
+}
+
+func clearPedestrianTransition(ped *Pedestrian) {
+	if ped == nil {
+		return
+	}
+	ped.TransitionActive = false
+	ped.TransitionDistance = 0
+	ped.TransitionLength = 0
+	ped.TransitionP0 = Vec2{}
+	ped.TransitionP1 = Vec2{}
+	ped.TransitionP2 = Vec2{}
+	ped.TransitionNextPath = 0
+	ped.TransitionNextForward = false
+	ped.TransitionEndOffset = 0
+}
+
+func PedestrianPose(paths []PedestrianPath, ped Pedestrian) (Vec2, Vec2, bool) {
+	if ped.PathIndex < 0 || ped.PathIndex >= len(paths) {
+		return Vec2{}, Vec2{}, false
+	}
+	raw := paths[ped.PathIndex]
+	diff := vecSub(raw.P1, raw.P0)
+	lengthSq := vectorLengthSq(diff)
+	if lengthSq <= 1e-6 {
+		return Vec2{}, Vec2{}, false
+	}
+	length := sqrtf(lengthSq)
+	path := pedestrianRuntimePath{
+		Valid:  true,
+		P0:     raw.P0,
+		P1:     raw.P1,
+		Length: length,
+		Dir:    vecScale(diff, 1/length),
+	}
+	path.Normal = NewVec2(-path.Dir.Y, path.Dir.X)
+	pos, heading := pedestrianCurrentPose(path, ped)
+	return pos, heading, true
+}
+
+func computePedestrianTargets(pedestrians []Pedestrian, topology pedestrianTopology) ([]float32, []float32) {
+	targetSpeeds := make([]float32, len(pedestrians))
+	targetOffsets := make([]float32, len(pedestrians))
+	maxOffset := PedestrianPathWidthM*0.5 - pedestrianRadiusM*1.1
+	for i, ped := range pedestrians {
+		path := topology.paths[ped.PathIndex]
+		targetOffset := preferredPedestrianOffset(ped.Forward, ped.SideBias)
+		targetSpeed := ped.BaseSpeed
+		selfCanonical := pedestrianCanonicalDistance(path, ped)
+		dirSign := float32(1)
+		if !ped.Forward {
+			dirSign = -1
+		}
+		for j, other := range pedestrians {
+			if i == j || other.PathIndex != ped.PathIndex {
+				continue
+			}
+			otherCanonical := pedestrianCanonicalDistance(path, other)
+			if ped.Forward == other.Forward {
+				relAhead := (otherCanonical - selfCanonical) * dirSign
+				if relAhead <= 0 || relAhead >= pedestrianSoftFollowDistM {
+					continue
+				}
+				slow := 1 - pedestrianSameDirectionSlowFactor*(1-relAhead/pedestrianSoftFollowDistM)
+				minSpeed := ped.BaseSpeed * pedestrianMinSpeedFactor
+				targetSpeed = minf(targetSpeed, maxf(minSpeed, ped.BaseSpeed*slow))
+				continue
+			}
+			separation := absf(otherCanonical - selfCanonical)
+			if separation >= pedestrianHeadOnLookaheadM {
+				continue
+			}
+			t := 1 - separation/pedestrianHeadOnLookaheadM
+			targetOffset += preferredPedestrianOffset(ped.Forward, 0) / pedestrianPreferredOffsetM * pedestrianHeadOnExtraOffsetM * t
+			slow := 1 - pedestrianHeadOnSlowdownStrength*t
+			minSpeed := ped.BaseSpeed * pedestrianMinSpeedFactor
+			targetSpeed = maxf(minSpeed, minf(targetSpeed, ped.BaseSpeed*slow))
+		}
+		targetSpeeds[i] = maxf(ped.BaseSpeed*pedestrianMinSpeedFactor, targetSpeed)
+		targetOffsets[i] = clampf(targetOffset, -maxOffset, maxOffset)
+	}
+	return targetSpeeds, targetOffsets
+}
+
+func chooseNextPedestrianEdge(topology pedestrianTopology, nodeKey NodeKey, currentPathIndex int) (int, bool, bool) {
+	neighbors := topology.neighborsByKey[nodeKey]
+	if len(neighbors) <= 1 {
+		return 0, false, false
+	}
+	candidates := make([]int, 0, len(neighbors)-1)
+	for _, idx := range neighbors {
+		if idx != currentPathIndex {
+			candidates = append(candidates, idx)
+		}
+	}
+	if len(candidates) == 0 {
+		return 0, false, false
+	}
+	nextPathIndex := candidates[rand.Intn(len(candidates))]
+	nextPath := topology.paths[nextPathIndex]
+	return nextPathIndex, nextPath.Node0 == nodeKey, true
+}
+
+func canSpawnPedestrianAtSource(source pedestrianSpawnSource, topology pedestrianTopology, pedestrians []Pedestrian) bool {
+	for _, ped := range pedestrians {
+		if ped.PathIndex != source.pathIndex || ped.Forward != source.forward {
+			continue
+		}
+		if ped.Distance < pedestrianSpawnClearanceM {
+			return false
+		}
+	}
+	return true
+}
+
+func pedestrianSpawnDelay() float32 {
+	return pedestrianSpawnIntervalS * randRange(1-pedestrianSpawnJitterFrac, 1+pedestrianSpawnJitterFrac)
+}
+
+// segmentIntersectionParams returns the parameters (t along a0->a1, u along
+// b0->b1) at which two line segments meet. Both parameters lie in [0,1] when
+// the segments actually cross. ok is false for parallel or degenerate segments.
+func segmentIntersectionParams(a0, a1, b0, b1 Vec2) (t, u float32, ok bool) {
+	r := vecSub(a1, a0)
+	s := vecSub(b1, b0)
+	denom := cross2D(r, s)
+	if absf(denom) < 1e-7 {
+		return 0, 0, false
+	}
+	qp := vecSub(b0, a0)
+	t = cross2D(qp, s) / denom
+	u = cross2D(qp, r) / denom
+	if t < 0 || t > 1 || u < 0 || u > 1 {
+		return 0, 0, false
+	}
+	return t, u, true
+}
+
+// computePedestrianCrossings finds every point where a pedestrian path meets a
+// car spline, using each spline's sampled polyline as an approximation. A path
+// may appear multiple times for a single spline if they cross more than once.
+func computePedestrianCrossings(paths []PedestrianPath, splines []Spline) []pedestrianCrossing {
+	if len(paths) == 0 || len(splines) == 0 {
+		return nil
+	}
+	var out []pedestrianCrossing
+	for pathIdx, p := range paths {
+		diff := vecSub(p.P1, p.P0)
+		pathLen := sqrtf(vectorLengthSq(diff))
+		if pathLen <= 1e-4 {
+			continue
+		}
+		for si := range splines {
+			s := &splines[si]
+			if s.Length <= 0 {
+				continue
+			}
+			for i := 1; i <= simSamples; i++ {
+				a0 := s.Samples[i-1]
+				a1 := s.Samples[i]
+				splineT, pathT, ok := segmentIntersectionParams(a0, a1, p.P0, p.P1)
+				if !ok {
+					continue
+				}
+				// Treat each spline segment as half-open at its end so an
+				// intersection exactly on a shared sample point is counted
+				// once. The final segment keeps its endpoint.
+				if splineT >= 1 && i < simSamples {
+					continue
+				}
+				segLen := s.CumLen[i] - s.CumLen[i-1]
+				splineDist := s.CumLen[i-1] + splineT*segLen
+				out = append(out, pedestrianCrossing{
+					SplineID:     s.ID,
+					DistOnSpline: splineDist,
+					PathIndex:    pathIdx,
+					DistOnPath:   pathT * pathLen,
+				})
+			}
+		}
+	}
+	return out
+}
+
+// buildPedestrianBlockedSplineDists returns, per spline ID, the distances at
+// which a pedestrian is near enough to a crossing to block cars as if it were
+// a red light. Duplicates may appear and are fine: the speed-cap function just
+// picks the most restrictive one.
+func buildPedestrianBlockedSplineDists(crossings []pedestrianCrossing, pedestrians []Pedestrian) map[int][]float32 {
+	if len(crossings) == 0 || len(pedestrians) == 0 {
+		return nil
+	}
+	byPath := make(map[int][]pedestrianCrossing, len(crossings))
+	for _, c := range crossings {
+		byPath[c.PathIndex] = append(byPath[c.PathIndex], c)
+	}
+	result := make(map[int][]float32)
+	for _, ped := range pedestrians {
+		pathCrossings := byPath[ped.PathIndex]
+		if len(pathCrossings) == 0 {
+			continue
+		}
+		for _, c := range pathCrossings {
+			if absf(ped.Distance-c.DistOnPath) > pedestrianCrossingBlockRadiusM {
+				continue
+			}
+			result[c.SplineID] = append(result[c.SplineID], c.DistOnSpline)
+		}
+	}
+	return result
+}
+
+// computePedestrianCrossingSpeedCap mirrors computeTrafficLightSpeedCap for
+// crossings blocked by pedestrians: a blocked crossing behaves like a red
+// light. Cars with enough distance will brake to stop before it; cars too
+// close simply miss the cap and keep going, matching red-light behaviour.
+func computePedestrianCrossingSpeedCap(car Car, currentSpline *Spline, graph *RoadGraph, blockedBySpline map[int][]float32) float32 {
+	if len(blockedBySpline) == 0 {
+		return float32(math.MaxFloat32)
+	}
+	decel := car.Accel * 1.5
+	result := float32(math.MaxFloat32)
+	remaining := currentSpline.Length - car.DistanceOnSpline
+	lookahead := car.Speed*car.Speed/(2*decel) + 20
+	if lookahead > 200 {
+		lookahead = 200
+	}
+
+	checkDist := func(rawDistAhead float32) {
+		adj := rawDistAhead - stopFrontGapM
+		if adj <= 0 {
+			result = 0
+			return
+		}
+		allowed := sqrtf(2 * decel * adj)
+		if allowed < result {
+			result = allowed
+		}
+	}
+
+	for _, d := range blockedBySpline[currentSpline.ID] {
+		if d <= car.DistanceOnSpline {
+			continue
+		}
+		checkDist(d - car.DistanceOnSpline)
+	}
+
+	if remaining < lookahead {
+		nextID, ok := ChooseNextSplineOnBestPathWithGraph(graph, currentSpline.ID, car.DestinationSplineID, car.VehicleKind)
+		if ok {
+			if _, ok2 := graph.splinePtrByID(nextID); ok2 {
+				for _, d := range blockedBySpline[nextID] {
+					checkDist(remaining + d)
+				}
+			}
+		}
+	}
+
+	return result
+}
+
+// anyCarOccupiesCrossing returns true if any car on the given spline is within
+// pedestrianCrossingCarRadiusM of the crossing point. The car's body is
+// [front - Length, front] where front is DistanceOnSpline. Stopped cars are
+// treated as yielding so pedestrians don't deadlock against one that already
+// came to rest on the crossing.
+func anyCarOccupiesCrossing(cars []Car, splineID int, distOnSpline float32) bool {
+	const stoppedCarSpeedMPS float32 = 0.5
+	lo := distOnSpline - pedestrianCrossingCarRadiusM
+	hi := distOnSpline + pedestrianCrossingCarRadiusM
+	for _, car := range cars {
+		if car.CurrentSplineID != splineID {
+			continue
+		}
+		if car.Speed < stoppedCarSpeedMPS {
+			continue
+		}
+		front := car.DistanceOnSpline
+		rear := front - car.Length
+		if front < lo || rear > hi {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// computePedestrianMovementCaps returns, for each pedestrian, the maximum
+// canonical distance they are allowed to advance along their current path this
+// step. MaxFloat32 means no cap. The cap is placed pedestrianCrossingStopBufferM
+// before any crossing whose spline currently has a car in it. Pedestrians on a
+// junction transition are skipped; they'll pick up a cap once they settle on
+// the next path.
+func computePedestrianMovementCaps(pedestrians []Pedestrian, topology pedestrianTopology, crossings []pedestrianCrossing, cars []Car) []float32 {
+	caps := make([]float32, len(pedestrians))
+	for i := range caps {
+		caps[i] = float32(math.MaxFloat32)
+	}
+	if len(crossings) == 0 || len(cars) == 0 {
+		return caps
+	}
+	byPath := make(map[int][]pedestrianCrossing, len(crossings))
+	for _, c := range crossings {
+		byPath[c.PathIndex] = append(byPath[c.PathIndex], c)
+	}
+	for i, ped := range pedestrians {
+		if ped.TransitionActive {
+			continue
+		}
+		if ped.PathIndex < 0 || ped.PathIndex >= len(topology.paths) {
+			continue
+		}
+		path := topology.paths[ped.PathIndex]
+		if !path.Valid {
+			continue
+		}
+		pathCrossings := byPath[ped.PathIndex]
+		if len(pathCrossings) == 0 {
+			continue
+		}
+		pedCanonical := pedestrianCanonicalDistance(path, ped)
+		for _, c := range pathCrossings {
+			var canonicalStop float32
+			if ped.Forward {
+				if c.DistOnPath <= ped.Distance {
+					continue
+				}
+				canonicalStop = c.DistOnPath - pedestrianCrossingStopBufferM
+			} else {
+				if c.DistOnPath >= ped.Distance {
+					continue
+				}
+				canonicalStop = path.Length - (c.DistOnPath + pedestrianCrossingStopBufferM)
+			}
+			if canonicalStop < 0 {
+				canonicalStop = 0
+			}
+			if !anyCarOccupiesCrossing(cars, c.SplineID, c.DistOnSpline) {
+				continue
+			}
+			if canonicalStop < caps[i] {
+				caps[i] = canonicalStop
+			}
+		}
+		// Pedestrian already at/past the cap: keep them from sliding forward.
+		if caps[i] < pedCanonical {
+			caps[i] = pedCanonical
+		}
+	}
+	return caps
+}
+
+func spawnPedestrianAtSource(source pedestrianSpawnSource) Pedestrian {
+	sideBias := randRange(-pedestrianSideBiasM, pedestrianSideBiasM)
+	baseSpeed := randRange(pedestrianSpeedMinMPS, pedestrianSpeedMaxMPS)
+	return Pedestrian{
+		PathIndex:     source.pathIndex,
+		Forward:       source.forward,
+		Distance:      pedestrianSpawnInsetM,
+		Speed:         baseSpeed,
+		BaseSpeed:     baseSpeed,
+		Radius:        pedestrianRadiusM,
+		LateralOffset: preferredPedestrianOffset(source.forward, sideBias),
+		SideBias:      sideBias,
+	}
+}
+
+func updatePedestrians(pedestrians []Pedestrian, paths []PedestrianPath, nextID *int, existingTimers map[pedestrianSpawnKey]float32, dt float32, crossings []pedestrianCrossing, cars []Car) ([]Pedestrian, map[pedestrianSpawnKey]float32) {
+	if len(paths) == 0 {
+		if existingTimers != nil {
+			clear(existingTimers)
+		}
+		return pedestrians[:0], existingTimers
+	}
+
+	topology := buildPedestrianTopology(paths)
+	active := make([]Pedestrian, 0, len(pedestrians))
+	for _, ped := range pedestrians {
+		if ped.PathIndex < 0 || ped.PathIndex >= len(topology.paths) {
+			continue
+		}
+		path := topology.paths[ped.PathIndex]
+		if !path.Valid {
+			continue
+		}
+		if ped.BaseSpeed <= 0 {
+			ped.BaseSpeed = randRange(pedestrianSpeedMinMPS, pedestrianSpeedMaxMPS)
+		}
+		if ped.Speed <= 0 {
+			ped.Speed = ped.BaseSpeed
+		}
+		if ped.Radius <= 0 {
+			ped.Radius = pedestrianRadiusM
+		}
+		ped.Distance = clampf(ped.Distance, 0, path.Length)
+		active = append(active, ped)
+	}
+
+	if dt > 0 && len(active) > 0 {
+		targetSpeeds, targetOffsets := computePedestrianTargets(active, topology)
+		movementCaps := computePedestrianMovementCaps(active, topology, crossings, cars)
+		for i := range active {
+			ped := active[i]
+			path := topology.paths[ped.PathIndex]
+			blocked := false
+			var canonicalCap float32
+			if i < len(movementCaps) && movementCaps[i] < float32(math.MaxFloat32) {
+				canonicalCap = movementCaps[i]
+				headroom := canonicalCap - pedestrianCanonicalDistance(path, ped)
+				if headroom <= 0.05 {
+					blocked = true
+					targetSpeeds[i] = 0
+				}
+			}
+			ped.Speed += (targetSpeeds[i] - ped.Speed) * clampf(dt*pedestrianSpeedResponseRate, 0, 1)
+			if !ped.TransitionActive {
+				ped.LateralOffset += (targetOffsets[i] - ped.LateralOffset) * clampf(dt*pedestrianLateralResponseRate, 0, 1)
+			}
+			var moveSpeed float32
+			if blocked {
+				moveSpeed = 0
+				ped.Speed = 0
+			} else {
+				moveSpeed = maxf(ped.Speed, ped.BaseSpeed*pedestrianMinSpeedFactor)
+			}
+			remaining := moveSpeed * dt
+			if i < len(movementCaps) && movementCaps[i] < float32(math.MaxFloat32) && !ped.TransitionActive {
+				headroom := movementCaps[i] - pedestrianCanonicalDistance(path, ped)
+				if headroom < 0 {
+					headroom = 0
+				}
+				if remaining > headroom {
+					remaining = headroom
+				}
+			}
+			alive := true
+			for remaining > 0 && alive {
+				if ped.TransitionActive {
+					transitionRemaining := ped.TransitionLength - ped.TransitionDistance
+					if remaining < transitionRemaining {
+						ped.TransitionDistance += remaining
+						remaining = 0
+						break
+					}
+					remaining -= transitionRemaining
+					ped.PathIndex = ped.TransitionNextPath
+					ped.Forward = ped.TransitionNextForward
+					ped.Distance = 0
+					ped.LateralOffset = ped.TransitionEndOffset
+					clearPedestrianTransition(&ped)
+					continue
+				}
+				path = topology.paths[ped.PathIndex]
+				distToEnd := path.Length - ped.Distance
+				if remaining < distToEnd {
+					ped.Distance += remaining
+					remaining = 0
+					break
+				}
+				remaining -= distToEnd
+				nodeKey := path.Node1
+				if !ped.Forward {
+					nodeKey = path.Node0
+				}
+				nextPathIndex, nextForward, ok := chooseNextPedestrianEdge(topology, nodeKey, ped.PathIndex)
+				if !ok {
+					alive = false
+					break
+				}
+				ped = buildPedestrianTurn(path, ped, topology.paths[nextPathIndex], nextForward)
+			}
+			if alive {
+				active[i] = ped
+			} else {
+				active[i].PathIndex = -1
+			}
+		}
+		write := active[:0]
+		for _, ped := range active {
+			if ped.PathIndex >= 0 {
+				write = append(write, ped)
+			}
+		}
+		active = write
+	}
+
+	nextTimers := make(map[pedestrianSpawnKey]float32, len(topology.deadEndSources))
+	for _, source := range topology.deadEndSources {
+		timer, ok := existingTimers[source.key]
+		if !ok || timer <= 0 {
+			timer = pedestrianSpawnDelay()
+		}
+		if dt > 0 {
+			timer -= dt
+		}
+		for timer <= 0 {
+			if canSpawnPedestrianAtSource(source, topology, active) {
+				ped := spawnPedestrianAtSource(source)
+				if nextID != nil {
+					ped.ID = *nextID
+					*nextID = *nextID + 1
+				}
+				active = append(active, ped)
+				timer += pedestrianSpawnDelay()
+			} else {
+				timer += pedestrianSpawnRetryDelayS
+				break
+			}
+		}
+		nextTimers[source.key] = timer
+	}
+	return active, nextTimers
+}
+
 type SavedSplineFile struct {
-	Splines       []SavedSpline       `json:"splines"`
-	Routes        []SavedRoute        `json:"routes,omitempty"`
-	Cars          []SavedCar          `json:"cars,omitempty"`
-	TrafficLights []SavedTrafficLight `json:"traffic_lights,omitempty"`
-	TrafficCycles []SavedTrafficCycle `json:"traffic_cycles,omitempty"`
+	Splines         []SavedSpline         `json:"splines"`
+	Routes          []SavedRoute          `json:"routes,omitempty"`
+	Cars            []SavedCar            `json:"cars,omitempty"`
+	TrafficLights   []SavedTrafficLight   `json:"traffic_lights,omitempty"`
+	TrafficCycles   []SavedTrafficCycle   `json:"traffic_cycles,omitempty"`
+	PedestrianPaths []SavedPedestrianPath `json:"pedestrian_paths,omitempty"`
+}
+
+type SavedPedestrianPath struct {
+	P0 Vec2 `json:"p0"`
+	P1 Vec2 `json:"p1"`
 }
 
 type SavedTrafficLight struct {
@@ -1200,11 +2021,12 @@ type SavedCar struct {
 
 func (w *World) Save(path string) error {
 	saved := SavedSplineFile{
-		Splines:       make([]SavedSpline, 0, len(w.Splines)),
-		Routes:        make([]SavedRoute, 0, len(w.Routes)),
-		Cars:          make([]SavedCar, 0, len(w.Cars)),
-		TrafficLights: make([]SavedTrafficLight, 0, len(w.TrafficLights)),
-		TrafficCycles: make([]SavedTrafficCycle, 0, len(w.TrafficCycles)),
+		Splines:         make([]SavedSpline, 0, len(w.Splines)),
+		Routes:          make([]SavedRoute, 0, len(w.Routes)),
+		Cars:            make([]SavedCar, 0, len(w.Cars)),
+		TrafficLights:   make([]SavedTrafficLight, 0, len(w.TrafficLights)),
+		TrafficCycles:   make([]SavedTrafficCycle, 0, len(w.TrafficCycles)),
+		PedestrianPaths: make([]SavedPedestrianPath, 0, len(w.PedestrianPaths)),
 	}
 	for _, spline := range w.Splines {
 		saved.Splines = append(saved.Splines, SavedSpline{
@@ -1286,6 +2108,12 @@ func (w *World) Save(path string) error {
 			ID:      c.ID,
 			Enabled: c.Enabled,
 			Phases:  phases,
+		})
+	}
+	for _, p := range w.PedestrianPaths {
+		saved.PedestrianPaths = append(saved.PedestrianPaths, SavedPedestrianPath{
+			P0: p.P0,
+			P1: p.P1,
 		})
 	}
 	data, err := json.MarshalIndent(saved, "", "  ")
@@ -1466,6 +2294,16 @@ func LoadWorld(path string) (*World, error) {
 			if i, ok := cycleIdx[l.CycleID]; ok {
 				world.TrafficCycles[i].LightIDs = append(world.TrafficCycles[i].LightIDs, l.ID)
 			}
+		}
+	}
+
+	if len(saved.PedestrianPaths) > 0 {
+		world.PedestrianPaths = make([]PedestrianPath, 0, len(saved.PedestrianPaths))
+		for _, entry := range saved.PedestrianPaths {
+			world.PedestrianPaths = append(world.PedestrianPaths, PedestrianPath{
+				P0: entry.P0,
+				P1: entry.P1,
+			})
 		}
 	}
 
@@ -3139,7 +3977,7 @@ func appendUpdatedCar(alive []Car, indexRemap []int, originalIndex int, car Car)
 	return append(alive, car)
 }
 
-func applyCurrentSplineSpeedUpdate(car *Car, route Route, currentSpline *Spline, graph *RoadGraph, stoppingLightsBySpline map[int][]TrafficLight, followCap float32, shouldHoldSpeed bool, dt float32) {
+func applyCurrentSplineSpeedUpdate(car *Car, route Route, currentSpline *Spline, graph *RoadGraph, stoppingLightsBySpline map[int][]TrafficLight, pedestrianBlockedBySpline map[int][]float32, followCap float32, shouldHoldSpeed bool, dt float32) {
 	targetSpeed := car.MaxSpeed * currentSpline.SpeedFactor
 	if currentSpline.SpeedLimitKmh > 0 {
 		if limitMPS := currentSpline.SpeedLimitKmh / 3.6; limitMPS < targetSpeed {
@@ -3154,6 +3992,9 @@ func applyCurrentSplineSpeedUpdate(car *Car, route Route, currentSpline *Spline,
 	}
 	if tl := computeTrafficLightSpeedCap(*car, currentSpline, graph, stoppingLightsBySpline); tl < targetSpeed {
 		targetSpeed = tl
+	}
+	if pc := computePedestrianCrossingSpeedCap(*car, currentSpline, graph, pedestrianBlockedBySpline); pc < targetSpeed {
+		targetSpeed = pc
 	}
 	if bs := computeBusStopSpeedCap(*car, route, currentSpline, graph); bs < targetSpeed {
 		targetSpeed = bs
@@ -3285,7 +4126,7 @@ func transitionCarToNextSpline(car *Car, route Route, graph *RoadGraph) bool {
 	return true
 }
 
-func resolveTransitionCar(pending pendingTransitionCar, graph *RoadGraph, stoppingLightsBySpline map[int][]TrafficLight, dt float32, alive []Car, indexRemap []int) ([]Car, bool) {
+func resolveTransitionCar(pending pendingTransitionCar, graph *RoadGraph, stoppingLightsBySpline map[int][]TrafficLight, pedestrianBlockedBySpline map[int][]float32, dt float32, alive []Car, indexRemap []int) ([]Car, bool) {
 	car := pending.car
 	var sampleCursor splineSampleCursor
 	sampleCursor.splineID = -1
@@ -3309,7 +4150,7 @@ func resolveTransitionCar(pending pendingTransitionCar, graph *RoadGraph, stoppi
 			return appendUpdatedCar(alive, indexRemap, pending.originalIndex, car), true
 		}
 
-		applyCurrentSplineSpeedUpdate(&car, pending.route, currentSpline, graph, stoppingLightsBySpline, pending.followCap, pending.shouldHoldSpeed, dt)
+		applyCurrentSplineSpeedUpdate(&car, pending.route, currentSpline, graph, stoppingLightsBySpline, pedestrianBlockedBySpline, pending.followCap, pending.shouldHoldSpeed, dt)
 		if car.DistanceOnSpline <= currentSpline.Length {
 			car = settleCarOnCurrentSpline(car, currentSpline, dt, &sampleCursor)
 			if shouldBeginBusStopDwell(car, pending.route, currentSpline, graph) {
@@ -3320,7 +4161,7 @@ func resolveTransitionCar(pending pendingTransitionCar, graph *RoadGraph, stoppi
 	}
 }
 
-func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions []bool, holdSpeedDecisions []bool, followCaps []float32, lights []TrafficLight, cycles []TrafficCycle, dt float32) ([]Car, []int, UpdateCarsProfile) {
+func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions []bool, holdSpeedDecisions []bool, followCaps []float32, lights []TrafficLight, cycles []TrafficCycle, pedestrianBlockedBySpline map[int][]float32, dt float32) ([]Car, []int, UpdateCarsProfile) {
 	profile := UpdateCarsProfile{Cars: len(cars)}
 	if len(cars) == 0 {
 		return cars, nil, profile
@@ -3412,7 +4253,7 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 				continue
 			}
 
-			applyCurrentSplineSpeedUpdate(&car, route, currentSpline, graph, stoppingLightsBySpline, followCap, shouldHoldSpeed, dt)
+			applyCurrentSplineSpeedUpdate(&car, route, currentSpline, graph, stoppingLightsBySpline, pedestrianBlockedBySpline, followCap, shouldHoldSpeed, dt)
 			if car.DistanceOnSpline <= currentSpline.Length {
 				var sampleCursor splineSampleCursor
 				sampleCursor.splineID = -1
@@ -3465,7 +4306,7 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 	transitionStart := time.Now()
 	for _, pending := range pendingTransitions {
 		var survived bool
-		alive, survived = resolveTransitionCar(pending, graph, stoppingLightsBySpline, dt, alive, indexRemap)
+		alive, survived = resolveTransitionCar(pending, graph, stoppingLightsBySpline, pedestrianBlockedBySpline, dt, alive, indexRemap)
 		if !survived {
 			profile.RemovedCars++
 		}

@@ -69,6 +69,7 @@ const (
 	ModeRules
 	ModeRoute
 	ModeTraffic
+	ModePedestrian
 	ModeDriving
 )
 
@@ -86,6 +87,7 @@ const (
 	ToolRouteEraser
 	ToolTrafficLight
 	ToolDrive
+	ToolPedestrianPath
 )
 
 const (
@@ -287,6 +289,7 @@ type editorWorldState struct {
 	Cars              []Car
 	TrafficLights     []TrafficLight
 	TrafficCycles     []TrafficCycle
+	PedestrianPaths   []simpkg.PedestrianPath
 
 	NextSplineID int
 	NextRouteID  int
@@ -305,6 +308,7 @@ func newEditorWorldState(world *simpkg.World) editorWorldState {
 		Cars:                 world.Cars,
 		TrafficLights:        world.TrafficLights,
 		TrafficCycles:        world.TrafficCycles,
+		PedestrianPaths:      world.PedestrianPaths,
 		NextSplineID:         world.NextSplineID,
 		NextRouteID:          world.NextRouteID,
 		NextLightID:          world.NextLightID,
@@ -321,6 +325,7 @@ func (s *editorWorldState) commit(world *simpkg.World) {
 	world.Cars = s.Cars
 	world.TrafficLights = s.TrafficLights
 	world.TrafficCycles = s.TrafficCycles
+	world.PedestrianPaths = s.PedestrianPaths
 	world.NextSplineID = s.NextSplineID
 	world.NextRouteID = s.NextRouteID
 	world.NextLightID = s.NextLightID
@@ -460,6 +465,7 @@ type RoutePanel struct {
 // pulled toward the hitch each tick, exactly mirroring the cab's rear-pull logic.
 type Trailer = simpkg.Trailer
 type Car = simpkg.Car
+type Pedestrian = simpkg.Pedestrian
 type TrajectorySample = simpkg.TrajectorySample
 type CollisionPrediction = simpkg.CollisionPrediction
 type BrakingProfile = simpkg.BrakingProfile
@@ -610,6 +616,7 @@ var modeToolbarItems = []modeToolbarItem{
 	{"Ru", "Rules", ModeRules, false, false, false},
 	{"Rt", "Route", ModeRoute, false, false, false},
 	{"Tr", "Traffic", ModeTraffic, false, false, false},
+	{"Pd", "Ped", ModePedestrian, false, false, false},
 	{"G", "Drive", ModeDriving, false, false, false},
 	{"I", "Info", 0, false, false, true},
 	{"D", "Debug", 0, true, false, false},
@@ -644,6 +651,10 @@ var drivingToolItems = []toolToolbarItem{
 	{"G", "Drive", ToolDrive},
 }
 
+var pedestrianToolItems = []toolToolbarItem{
+	{"W", "Path", ToolPedestrianPath},
+}
+
 const (
 	toolbarBtnW   = 70
 	toolbarBtnH   = 75
@@ -673,6 +684,8 @@ func toolsForMode(mode EditorMode) []toolToolbarItem {
 		return routeToolItems
 	case ModeTraffic:
 		return trafficToolItems
+	case ModePedestrian:
+		return pedestrianToolItems
 	case ModeDriving:
 		return drivingToolItems
 	default:
@@ -690,6 +703,8 @@ func modeForTool(tool EditorTool) EditorMode {
 		return ModeRoute
 	case ToolTrafficLight:
 		return ModeTraffic
+	case ToolPedestrianPath:
+		return ModePedestrian
 	case ToolDrive:
 		return ModeDriving
 	default:
@@ -707,6 +722,8 @@ func defaultToolForMode(mode EditorMode) EditorTool {
 		return ToolRouteCars
 	case ModeTraffic:
 		return ToolTrafficLight
+	case ModePedestrian:
+		return ToolPedestrianPath
 	case ModeDriving:
 		return ToolDrive
 	default:
@@ -722,7 +739,7 @@ func isMouseOverToolbar(mouse Vec2) bool {
 		return true
 	}
 	toolN := 0
-	for _, mode := range []EditorMode{ModeDraw, ModeRules, ModeRoute, ModeTraffic, ModeDriving} {
+	for _, mode := range []EditorMode{ModeDraw, ModeRules, ModeRoute, ModeTraffic, ModePedestrian, ModeDriving} {
 		if n := len(toolsForMode(mode)); n > toolN {
 			toolN = n
 		}
@@ -772,6 +789,7 @@ func main() {
 	draft := newDraft()
 	quadraticDraft := newQuadraticDraft()
 	cutDraft := newCutDraft()
+	pedestrianDraft := pedestrianPathDraft{}
 	routePanel := RoutePanel{}
 	routeStartSplineID := -1
 	coupleModeFirstID := -1
@@ -803,6 +821,7 @@ func main() {
 		draft = newDraft()
 		quadraticDraft = newQuadraticDraft()
 		cutDraft = newCutDraft()
+		pedestrianDraft = pedestrianPathDraft{}
 		routePanel = RoutePanel{}
 		routeStartSplineID = -1
 		coupleModeFirstID = -1
@@ -837,6 +856,7 @@ func main() {
 		dt := rl.GetFrameTime()
 		camera.Offset = rl.NewVector2(float32(rl.GetScreenWidth())/2, float32(rl.GetScreenHeight())/2)
 		editorMutatedWorld := false
+		pedestrianTopologyChanged := false
 
 		if !paused {
 			simAccumDT += dt
@@ -859,6 +879,8 @@ func main() {
 			case ModeRoute:
 				setMode(ModeTraffic)
 			case ModeTraffic:
+				setMode(ModePedestrian)
+			case ModePedestrian:
 				setMode(ModeDriving)
 			default:
 				setMode(ModeDraw)
@@ -902,6 +924,9 @@ func main() {
 		}
 		if rl.IsKeyPressed(rl.KeyG) {
 			setTool(ToolDrive)
+		}
+		if rl.IsKeyPressed(rl.KeyW) {
+			setTool(ToolPedestrianPath)
 		}
 		if rl.IsKeyPressed(rl.KeyD) {
 			debugMode = !debugMode
@@ -953,6 +978,7 @@ func main() {
 					draft = newDraft()
 					quadraticDraft = newQuadraticDraft()
 					cutDraft = newCutDraft()
+					pedestrianDraft = pedestrianPathDraft{}
 					routePanel = RoutePanel{}
 					routeStartSplineID = -1
 					coupleModeFirstID = -1
@@ -1029,6 +1055,7 @@ func main() {
 		cars := editorState.Cars
 		trafficLights := editorState.TrafficLights
 		trafficCycles := editorState.TrafficCycles
+		pedestrianPaths := editorState.PedestrianPaths
 		nextSplineID := editorState.NextSplineID
 		nextRouteID := editorState.NextRouteID
 		nextLightID := editorState.NextLightID
@@ -1230,6 +1257,13 @@ func main() {
 				splines, lastPref = handlePreferenceMode(splines, hoveredSpline, lastPref)
 				if hoveredSpline >= 0 && (rl.IsMouseButtonPressed(rl.MouseButtonLeft) || rl.IsMouseButtonPressed(rl.MouseButtonRight)) {
 					editorMutatedWorld = true
+				}
+			case ToolPedestrianPath:
+				var changed bool
+				pedestrianDraft, pedestrianPaths, changed = handlePedestrianPathMode(pedestrianDraft, pedestrianPaths, mouseWorld, camera.Zoom)
+				if changed {
+					editorMutatedWorld = true
+					pedestrianTopologyChanged = true
 				}
 			case ToolTrafficLight:
 				phaseCount := 0
@@ -1486,11 +1520,15 @@ func main() {
 		editorState.Cars = cars
 		editorState.TrafficLights = trafficLights
 		editorState.TrafficCycles = trafficCycles
+		editorState.PedestrianPaths = pedestrianPaths
 		editorState.NextSplineID = nextSplineID
 		editorState.NextRouteID = nextRouteID
 		editorState.NextLightID = nextLightID
 		editorState.NextCycleID = nextCycleID
 		editorState.commit(&world)
+		if pedestrianTopologyChanged {
+			world.ResetPedestrianRuntime()
+		}
 		if mode == ModeDriving && playerCar.Active {
 			world.UpdatePlayerProxy(simpkg.PlayerProxyFitInput{
 				Position:            playerCar.Position,
@@ -1504,6 +1542,7 @@ func main() {
 			})
 		}
 		cars = world.Cars
+		pedestrians := world.Pedestrians
 
 		if editorMutatedWorld {
 			worldRevision++
@@ -1529,6 +1568,12 @@ func main() {
 		viewRect := cameraWorldRect(camera, pixelsToWorld(camera.Zoom, 64))
 		drawGrid(camera)
 		drawAxes(camera)
+
+		drawPedestrianPaths(pedestrianPaths, viewRect)
+		if tool == ToolPedestrianPath {
+			drawPedestrianPathTool(pedestrianDraft, pedestrianPaths, mouseWorld, camera.Zoom)
+		}
+		drawPedestrians(pedestrians, pedestrianPaths, camera.Zoom, viewRect)
 
 		splineIndexByID := simpkg.BuildSplineIndexByID(splines)
 		directionWarnings := findDirectionWarnings(splines)
@@ -4548,6 +4593,8 @@ func modeStatusText(mode EditorMode, tool EditorTool, stage Stage, draft Draft, 
 		return "Left click on spline: add light to cycle   Right click on light: remove from cycle   Then press Create"
 	case ToolDrive:
 		return "Use arrow keys to drive. Right click a spline end to set the destination."
+	case ToolPedestrianPath:
+		return "Left click: first edge, second edge places a 4 m path   Right click: cancel draft or delete hovered path"
 	}
 	switch mode {
 	case ModeDraw:
@@ -4558,6 +4605,8 @@ func modeStatusText(mode EditorMode, tool EditorTool, stage Stage, draft Draft, 
 		return "Route tools"
 	case ModeTraffic:
 		return "Traffic tools"
+	case ModePedestrian:
+		return "Pedestrian tools"
 	case ModeDriving:
 		return "Driving"
 	default:
@@ -4575,6 +4624,8 @@ func modeName(mode EditorMode) string {
 		return "Route"
 	case ModeTraffic:
 		return "Traffic"
+	case ModePedestrian:
+		return "Pedestrian"
 	case ModeDriving:
 		return "Drive"
 	default:
@@ -4610,6 +4661,8 @@ func toolName(tool EditorTool) string {
 		return "Traffic"
 	case ToolDrive:
 		return "Drive"
+	case ToolPedestrianPath:
+		return "Ped Path"
 	default:
 		return "Unknown"
 	}
@@ -4694,6 +4747,12 @@ func hudInfoLines(mode EditorMode, tool EditorTool, stage Stage, draft Draft, qu
 			"The camera follows the player, keeps the car centered, and rotates the world so the car always points toward the top of the screen.",
 			"Right click a spline end to set the current destination node for later route/path logic.",
 			"Leaving driving mode removes the player car and restores the normal editor camera orientation.",
+		)
+	case ToolPedestrianPath:
+		controls = append(controls,
+			"Pedestrian path tool: left click places the first edge of a 4 m-wide path, second left click places the opposite edge and commits it.",
+			"Endpoints snap to existing pedestrian path endpoints within a small radius, so multiple paths can share a junction.",
+			"Right click with a draft in progress cancels it; right click on a hovered path removes that path.",
 		)
 	default:
 		controls = append(controls, fmt.Sprintf("%s mode: use the toolbar or shortcuts to switch to a tool for editing.", modeName(mode)))
@@ -5855,4 +5914,196 @@ func absf(v float32) float32 {
 		return -v
 	}
 	return v
+}
+
+// ---------- pedestrian paths ----------
+
+// pedestrianPathDraft tracks the two-click placement state: HasP0=false means
+// the next left click places the first endpoint; HasP0=true means the next
+// left click commits a path from P0 to the current cursor position.
+type pedestrianPathDraft struct {
+	P0    Vec2
+	HasP0 bool
+}
+
+// pedestrianEndpointSnapPixels is the screen-space snap radius for locking a
+// new endpoint onto an existing pedestrian path endpoint.
+const pedestrianEndpointSnapPixels float32 = 14.0
+
+// pedestrianMinSegmentLengthM rejects zero- or near-zero-length paths from
+// accidental double clicks. 0.5 m keeps the rule intuitive for 4 m-wide paths.
+const pedestrianMinSegmentLengthM float32 = 0.5
+
+func snapPedestrianEndpoint(point Vec2, paths []simpkg.PedestrianPath, zoom float32) Vec2 {
+	radius := pixelsToWorld(zoom, pedestrianEndpointSnapPixels)
+	radiusSq := radius * radius
+	best := point
+	bestSq := radiusSq
+	for _, p := range paths {
+		if d := distSq(point, p.P0); d < bestSq {
+			bestSq = d
+			best = p.P0
+		}
+		if d := distSq(point, p.P1); d < bestSq {
+			bestSq = d
+			best = p.P1
+		}
+	}
+	return best
+}
+
+func findNearestPedestrianEndpoint(point Vec2, paths []simpkg.PedestrianPath, radius float32) (Vec2, bool) {
+	radiusSq := radius * radius
+	bestSq := radiusSq
+	best := Vec2{}
+	found := false
+	for _, p := range paths {
+		if d := distSq(point, p.P0); d < bestSq {
+			bestSq = d
+			best = p.P0
+			found = true
+		}
+		if d := distSq(point, p.P1); d < bestSq {
+			bestSq = d
+			best = p.P1
+			found = true
+		}
+	}
+	return best, found
+}
+
+func pointSegmentDistSq(p, a, b Vec2) float32 {
+	ab := vecSub(b, a)
+	lenSq := dot(ab, ab)
+	if lenSq <= 1e-9 {
+		return distSq(p, a)
+	}
+	t := dot(vecSub(p, a), ab) / lenSq
+	if t < 0 {
+		t = 0
+	} else if t > 1 {
+		t = 1
+	}
+	return distSq(p, vecAdd(a, vecScale(ab, t)))
+}
+
+func findPedestrianPathAt(paths []simpkg.PedestrianPath, point Vec2, radius float32) int {
+	halfWidth := simpkg.PedestrianPathWidthM * 0.5
+	tol := halfWidth + radius
+	bestSq := tol * tol
+	idx := -1
+	for i, p := range paths {
+		if d := pointSegmentDistSq(point, p.P0, p.P1); d < bestSq {
+			bestSq = d
+			idx = i
+		}
+	}
+	return idx
+}
+
+func handlePedestrianPathMode(draft pedestrianPathDraft, paths []simpkg.PedestrianPath, mouseWorld Vec2, zoom float32) (pedestrianPathDraft, []simpkg.PedestrianPath, bool) {
+	changed := false
+	if rl.IsKeyPressed(rl.KeyEscape) && draft.HasP0 {
+		draft = pedestrianPathDraft{}
+	}
+	if rl.IsMouseButtonPressed(rl.MouseButtonRight) {
+		if draft.HasP0 {
+			draft = pedestrianPathDraft{}
+		} else {
+			radius := pixelsToWorld(zoom, hoverPixels)
+			if idx := findPedestrianPathAt(paths, mouseWorld, radius); idx >= 0 {
+				paths = append(paths[:idx], paths[idx+1:]...)
+				changed = true
+			}
+		}
+	}
+	if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		snapped := snapPedestrianEndpoint(mouseWorld, paths, zoom)
+		if !draft.HasP0 {
+			draft.P0 = snapped
+			draft.HasP0 = true
+		} else {
+			if distSq(draft.P0, snapped) >= pedestrianMinSegmentLengthM*pedestrianMinSegmentLengthM {
+				paths = append(paths, simpkg.PedestrianPath{P0: draft.P0, P1: snapped})
+				changed = true
+			}
+			draft = pedestrianPathDraft{}
+		}
+	}
+	return draft, paths, changed
+}
+
+// ---------- pedestrian path rendering ----------
+
+var pedestrianPathColor = NewColor(196, 178, 140, 220) // tan
+
+func drawPedestrianPaths(paths []simpkg.PedestrianPath, viewRect worldRect) {
+	if len(paths) == 0 {
+		return
+	}
+	for _, p := range paths {
+		if !segmentVisibleInWorldRect(p.P0, p.P1, simpkg.PedestrianPathWidthM, viewRect) {
+			continue
+		}
+		drawLineEx(p.P0, p.P1, simpkg.PedestrianPathWidthM, pedestrianPathColor)
+	}
+}
+
+func drawPedestrians(pedestrians []Pedestrian, paths []simpkg.PedestrianPath, zoom float32, viewRect worldRect) {
+	if len(pedestrians) == 0 || len(paths) == 0 {
+		return
+	}
+	bodyColor := NewColor(46, 74, 93, 230)
+	headColor := NewColor(236, 205, 177, 245)
+	outlineColor := NewColor(245, 245, 245, 150)
+	for _, ped := range pedestrians {
+		pos, heading, ok := simpkg.PedestrianPose(paths, ped)
+		if !ok {
+			continue
+		}
+		bodyRadius := maxf(ped.Radius, pixelsToWorld(zoom, 3.5))
+		if !circleVisibleInWorldRect(pos, bodyRadius*2.0, viewRect) {
+			continue
+		}
+		headPos := vecAdd(pos, vecScale(heading, bodyRadius*0.85))
+		drawCircleV(pos, bodyRadius, bodyColor)
+		drawCircleV(headPos, bodyRadius*0.58, headColor)
+		drawCircleLinesV(pos, bodyRadius, outlineColor)
+	}
+}
+
+func drawPedestrianPathTool(draft pedestrianPathDraft, paths []simpkg.PedestrianPath, mouseWorld Vec2, zoom float32) {
+	endpointRadius := pixelsToWorld(zoom, handlePixels)
+	endpointColor := NewColor(120, 90, 40, 255)
+	for _, p := range paths {
+		drawCircleV(p.P0, endpointRadius*0.9, endpointColor)
+		drawCircleV(p.P1, endpointRadius*0.9, endpointColor)
+	}
+	snapped := snapPedestrianEndpoint(mouseWorld, paths, zoom)
+	snappedToExisting := distSq(snapped, mouseWorld) > 1e-6
+	if snappedToExisting {
+		drawCircleLinesV(snapped, endpointRadius*1.5, NewColor(255, 196, 61, 255))
+	}
+	if draft.HasP0 {
+		previewColor := NewColor(214, 76, 76, 180)
+		drawLineEx(draft.P0, snapped, simpkg.PedestrianPathWidthM, previewColor)
+		drawCircleV(draft.P0, endpointRadius, NewColor(214, 76, 76, 255))
+	}
+}
+
+// segmentVisibleInWorldRect tests whether a thick line segment's AABB overlaps
+// the view rectangle. Cheap reject for offscreen paths.
+func segmentVisibleInWorldRect(a, b Vec2, thickness float32, viewRect worldRect) bool {
+	pad := thickness * 0.5
+	minX := minf(a.X, b.X) - pad
+	maxX := maxf(a.X, b.X) + pad
+	minY := minf(a.Y, b.Y) - pad
+	maxY := maxf(a.Y, b.Y) + pad
+	if maxX < viewRect.MinX || minX > viewRect.MaxX {
+		return false
+	}
+	if maxY < viewRect.MinY || minY > viewRect.MaxY {
+		return false
+	}
+	return true
 }
