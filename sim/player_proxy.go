@@ -51,7 +51,7 @@ func playerProxyReferencePosition(input PlayerProxyFitInput) Vec2 {
 		return ref
 	}
 	forward := normalize(input.Heading)
-	frontOffset := input.Length * wheelbaseFrac * 0.5
+	frontOffset := input.Length * defaultWheelbaseFrac * 0.5
 	return vecAdd(ref, vecScale(forward, frontOffset))
 }
 
@@ -252,6 +252,10 @@ func buildPlayerProxyCar(input PlayerProxyFitInput, attachment PlayerProxyAttach
 		width = 1.9
 	}
 
+	pivotHeading := tangent
+	if vectorLengthSq(input.Heading) > 1e-9 {
+		pivotHeading = normalize(input.Heading)
+	}
 	car := Car{
 		ID:                  input.CarID,
 		RouteID:             -1,
@@ -260,13 +264,17 @@ func buildPlayerProxyCar(input PlayerProxyFitInput, attachment PlayerProxyAttach
 		DestinationSplineID: attachment.CurrentSplineID,
 		PrevSplineIDs:       attachment.PrevSplineIDs,
 		DistanceOnSpline:    attachment.DistanceOnSpline,
-		RearPosition:        vecSub(frontPos, vecScale(bodyHeading, length*wheelbaseFrac)),
+		RearPosition:        vecSub(frontPos, vecScale(bodyHeading, length*defaultWheelbaseFrac)),
+		PrevFrontPosition:   frontPos,
+		Heading:             pivotHeading,
 		LateralOffset:       attachment.LateralOffset,
 		Speed:               absf(input.Speed),
 		MaxSpeed:            maxf(absf(input.Speed), 1),
 		Accel:               0,
 		Length:              length,
 		Width:               width,
+		FrontPivotFrac:      defaultFrontPivotFrac,
+		RearPivotFrac:       defaultRearPivotFrac,
 		Color:               input.Color,
 		LaneChangeSplineID:  -1,
 		AfterSplineID:       -1,

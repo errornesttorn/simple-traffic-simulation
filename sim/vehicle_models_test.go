@@ -88,11 +88,38 @@ func TestSpawnVehicleInheritsFromModel(t *testing.T) {
 	if absf(car.CurveSpeedMultiplier-model.CurveSpeedMultiplier) > 1e-3 {
 		t.Fatalf("curve multiplier %.3f does not match model %.3f", car.CurveSpeedMultiplier, model.CurveSpeedMultiplier)
 	}
+	if absf(car.FrontPivotFrac-model.FrontPivotFrac) > 1e-6 {
+		t.Fatalf("front pivot frac %.4f does not match model %.4f", car.FrontPivotFrac, model.FrontPivotFrac)
+	}
+	if absf(car.RearPivotFrac-model.RearPivotFrac) > 1e-6 {
+		t.Fatalf("rear pivot frac %.4f does not match model %.4f", car.RearPivotFrac, model.RearPivotFrac)
+	}
+	if absf(car.WheelbaseFrac()-(model.RearPivotFrac-model.FrontPivotFrac)) > 1e-6 {
+		t.Fatalf("WheelbaseFrac %.4f does not match model %.4f", car.WheelbaseFrac(), model.RearPivotFrac-model.FrontPivotFrac)
+	}
 	if model.Trailer != nil && !car.Trailer.HasTrailer {
 		t.Fatal("expected spawned car to carry a trailer based on model definition")
 	}
 	if model.Trailer == nil && car.Trailer.HasTrailer {
 		t.Fatal("spawned car has a trailer but its model has none")
+	}
+}
+
+func TestVehicleModelsHaveVariedPivots(t *testing.T) {
+	models := append([]VehicleModel{}, CarModels()...)
+	models = append(models, BusModels()...)
+	if len(models) == 0 {
+		t.Fatal("no vehicle models to inspect")
+	}
+	seenFront := map[float32]bool{}
+	for _, m := range models {
+		if m.FrontPivotFrac <= 0 || m.RearPivotFrac <= m.FrontPivotFrac || m.RearPivotFrac >= 1 {
+			t.Fatalf("model %q has invalid pivot fractions front=%.3f rear=%.3f", m.ID, m.FrontPivotFrac, m.RearPivotFrac)
+		}
+		seenFront[m.FrontPivotFrac] = true
+	}
+	if len(seenFront) < 2 {
+		t.Fatalf("expected at least two distinct front_pivot_frac values across models, saw %d", len(seenFront))
 	}
 }
 

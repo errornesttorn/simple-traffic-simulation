@@ -177,14 +177,6 @@ const (
 	curveSpeedIntervalM       float32 = 10.0       // arc-length spacing of curvature speed samples (m)
 	maxLateralAccelMPS2       float32 = 5.0        // max lateral acceleration for curve speed (m/s²)
 	collisionBroadPhaseSlackM float32 = 5.0
-
-	// Pivot fractions: the spline-following point sits 20% from the front and
-	// the dragged rear pivot sits 80% from the front (20% from the rear).
-	// This models axle positions rather than bumpers, giving realistic turning.
-	frontPivotFrac float32 = 0.20 // fraction of length from front bumper to front pivot
-	rearPivotFrac  float32 = 0.80 // fraction of length from front bumper to rear pivot
-	// Wheelbase = distance between the two pivots as a fraction of car length.
-	wheelbaseFrac float32 = rearPivotFrac - frontPivotFrac // 0.60
 )
 
 type Vec2 = simpkg.Vec2
@@ -1726,7 +1718,7 @@ func main() {
 		allSplineIndexByID := simpkg.BuildSplineIndexByID(allSplines)
 		drawCars(cars, allSplines, allSplineIndexByID, camera.Zoom, debugMode, viewRect)
 		if hitboxDebugMode {
-			drawCarHitboxes(cars, allSplines, allSplineIndexByID, viewRect)
+			drawCarHitboxes(cars, allSplines, allSplineIndexByID, camera.Zoom, viewRect)
 		}
 		if debugMode {
 			drawDebugBlameLinks(debugBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(220, 50, 50, 220), viewRect)
@@ -4618,10 +4610,11 @@ func drawDrivingDestination(player playerCarState, zoom float32, viewRect worldR
 }
 
 // drawCarHitboxes renders the multi-circle collision hitbox of every car.
-func drawCarHitboxes(cars []Car, splines []Spline, splineIndexByID map[int]int, viewRect worldRect) {
+func drawCarHitboxes(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom float32, viewRect worldRect) {
 	fill := NewColor(255, 80, 255, 50)
 	outline := NewColor(255, 80, 255, 200)
 	pivotColor := NewColor(255, 220, 0, 220)
+	arrowThick := pixelsToWorld(zoom, 1.5)
 	for _, car := range cars {
 		splineIdx, ok := splineIndexByID[car.CurrentSplineID]
 		if !ok {
@@ -4647,10 +4640,29 @@ func drawCarHitboxes(cars []Car, splines []Spline, splineIndexByID map[int]int, 
 				drawCircleLinesV(circlePos, r, outline)
 			}
 		}
-		// Mark front and rear pivots.
+		// Mark front and rear pivots, plus a small arrow at the front pivot
+		// pointing along the pivot's actual direction of motion (Car.Heading,
+		// updated by the sim from the front pivot's frame-to-frame
+		// displacement). On curves this differs from the body axis.
 		if bodyVisible {
 			drawCircleV(frontPos, r*0.25, pivotColor)
 			drawCircleV(car.RearPosition, r*0.25, pivotColor)
+			arrowDir := car.Heading
+			if vectorLengthSq(arrowDir) <= 1e-9 {
+				arrowDir = bodyHeading
+			} else {
+				arrowDir = normalize(arrowDir)
+			}
+			arrowLen := r * 1.4
+			tip := vecAdd(frontPos, vecScale(arrowDir, arrowLen))
+			drawLineEx(frontPos, tip, arrowThick, pivotColor)
+			left := Vec2{X: -arrowDir.Y, Y: arrowDir.X}
+			headLen := arrowLen * 0.45
+			back := vecSub(tip, vecScale(arrowDir, headLen))
+			leftBase := vecAdd(back, vecScale(left, headLen*0.55))
+			rightBase := vecSub(back, vecScale(left, headLen*0.55))
+			drawLineEx(tip, leftBase, arrowThick, pivotColor)
+			drawLineEx(tip, rightBase, arrowThick, pivotColor)
 		}
 
 		if car.Trailer.HasTrailer {

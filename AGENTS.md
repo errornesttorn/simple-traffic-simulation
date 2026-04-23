@@ -223,10 +223,15 @@ cars). Speed caps are min-combined with the posted `SpeedLimitKmh`.
 Cars have a *rear reference point* (`RearPosition`). The position used for
 trajectory-sampling is the "front pivot" at `P0 + rightNormal *
 LateralOffset` on the spline; the rear is dragged behind at distance
-`Length * wheelbaseFrac` (with `wheelbaseFrac = 0.6`). Trailers hitch to
-that rear point with the same model. This is why the prediction code
-carries `simRearPos` and `simTrailerRearPos` as mutable state separate
-from the spline-distance position.
+`Length * Car.WheelbaseFrac()`. Each `VehicleModel` declares its own
+`front_pivot_frac` and `rear_pivot_frac` (cars typically ~0.18–0.22 from
+the front and back; vans/buses run cab-forward at ~0.10–0.13), and the
+spawn step copies them onto the `Car` struct so each vehicle pivots
+according to its make. `defaultFrontPivotFrac` / `defaultRearPivotFrac`
+(0.20 / 0.80) cover model-less cases like the player proxy. Trailers
+hitch to the car's rear point with the same wheelbase fraction. This is
+why the prediction code carries `simRearPos` and `simTrailerRearPos` as
+mutable state separate from the spline-distance position.
 
 ### Pedestrians
 

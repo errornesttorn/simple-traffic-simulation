@@ -7,7 +7,9 @@
       "width_m": 2.55,
       "max_speed_mps": 18.0,
       "accel": 1.5,
-      "curve_speed_multiplier": 0.95
+      "curve_speed_multiplier": 0.95,
+      "front_pivot_frac": 0.10,
+      "rear_pivot_frac": 0.90
     },
     {
       "id": "bus_articulated",
@@ -17,6 +19,8 @@
       "max_speed_mps": 16.5,
       "accel": 1.3,
       "curve_speed_multiplier": 0.90,
+      "front_pivot_frac": 0.12,
+      "rear_pivot_frac": 0.88,
       "trailer": {
         "length_m": 8.5,
         "width_m": 2.55

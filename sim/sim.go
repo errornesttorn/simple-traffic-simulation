@@ -91,12 +91,17 @@ const (
 	collisionBroadPhaseSlackM float32 = 5.0
 	// The car is modelled as a front pivot that rides exactly on the spline
 	// offset by LateralOffset, and a rear point dragged behind it at
-	// Length * wheelbaseFrac. Trailers hitch to the rear point using the
-	// same scheme. predictCarTrajectory carries simRearPos as mutable state
-	// because its lag produces the body heading (not just the spline tangent).
-	frontPivotFrac float32 = 0.20
-	rearPivotFrac  float32 = 0.80
-	wheelbaseFrac  float32 = rearPivotFrac - frontPivotFrac
+	// Length * WheelbaseFrac (Car.RearPivotFrac - Car.FrontPivotFrac).
+	// Trailers hitch to the rear point using the same scheme.
+	// predictCarTrajectory carries simRearPos as mutable state because its
+	// lag produces the body heading (not just the spline tangent).
+	//
+	// These defaults are used only as a fallback when a Car is constructed
+	// without a backing VehicleModel (e.g. the player proxy car or tests).
+	// Real spawned cars carry per-model pivot fractions on the Car struct.
+	defaultFrontPivotFrac float32 = 0.20
+	defaultRearPivotFrac  float32 = 0.80
+	defaultWheelbaseFrac  float32 = defaultRearPivotFrac - defaultFrontPivotFrac
 )
 
 const (
@@ -229,6 +234,16 @@ type Car struct {
 	PrevSplineIDs        [2]int
 	DistanceOnSpline     float32
 	RearPosition         Vec2
+	// PrevFrontPosition is the front pivot position from the previous sim
+	// step. Combined with the current front pivot it yields the actual
+	// direction the pivot is travelling in (which differs from the body
+	// axis on curves and during lane changes).
+	PrevFrontPosition Vec2
+	// Heading is the unit-length direction the front pivot is currently
+	// moving in. Updated by settleCarOnCurrentSpline each step from the
+	// frame-to-frame displacement of the front pivot. Falls back to the
+	// spline tangent at spawn / load and when the car is stationary.
+	Heading              Vec2
 	LateralOffset        float32
 	Speed                float32
 	MaxSpeed             float32
@@ -236,6 +251,12 @@ type Car struct {
 	Length               float32
 	Width                float32
 	CurveSpeedMultiplier float32
+	// FrontPivotFrac and RearPivotFrac are per-vehicle pivot positions along
+	// the body, measured as fractions of Length from the front bumper. Their
+	// difference is the effective wheelbase fraction used for the rear-point
+	// drag and trailer hitch maths.
+	FrontPivotFrac       float32
+	RearPivotFrac        float32
 	Color                Color
 	Braking              bool
 	SoftSlowing          bool
@@ -262,6 +283,17 @@ type Car struct {
 	TurnSignal TurnSignalState
 
 	Trailer Trailer
+}
+
+// WheelbaseFrac returns the distance between the front and rear pivots as a
+// fraction of the vehicle length. Falls back to defaultWheelbaseFrac when the
+// car has no model-derived pivots set (player proxies, hand-built test cars).
+func (c Car) WheelbaseFrac() float32 {
+	wb := c.RearPivotFrac - c.FrontPivotFrac
+	if wb <= 0 {
+		return defaultWheelbaseFrac
+	}
+	return wb
 }
 
 type carControlSplit struct {
@@ -2498,12 +2530,22 @@ func LoadWorld(path string) (*World, error) {
 		if car.CurveSpeedMultiplier == 0 {
 			car.CurveSpeedMultiplier = randRange(0.8, 1.2)
 		}
+		if model, ok := LookupVehicleModel(car.ModelID); ok {
+			car.FrontPivotFrac = model.FrontPivotFrac
+			car.RearPivotFrac = model.RearPivotFrac
+		} else {
+			car.FrontPivotFrac = defaultFrontPivotFrac
+			car.RearPivotFrac = defaultRearPivotFrac
+		}
 		if spline, ok := FindSplineByID(world.Splines, car.CurrentSplineID); ok {
 			frontPos, tangent := SampleSplineAtDistance(spline, car.DistanceOnSpline)
+			wbFrac := car.WheelbaseFrac()
 			car.RearPosition = Vec2{
-				X: frontPos.X - tangent.X*car.Length*wheelbaseFrac,
-				Y: frontPos.Y - tangent.Y*car.Length*wheelbaseFrac,
+				X: frontPos.X - tangent.X*car.Length*wbFrac,
+				Y: frontPos.Y - tangent.Y*car.Length*wbFrac,
 			}
+			car.PrevFrontPosition = frontPos
+			car.Heading = tangent
 		}
 		if car.VehicleKind == VehicleBus {
 			for _, route := range world.Routes {
@@ -2879,6 +2921,8 @@ func spawnVehicle(carID int, route Route, splines []Spline) Car {
 		Length:               model.LengthM / metersPerUnit,
 		Width:                model.WidthM / metersPerUnit,
 		CurveSpeedMultiplier: model.CurveSpeedMultiplier,
+		FrontPivotFrac:       model.FrontPivotFrac,
+		RearPivotFrac:        model.RearPivotFrac,
 		Color:                route.Color,
 		Braking:              false,
 		LaneChangeSplineID:   -1,
@@ -2888,14 +2932,17 @@ func spawnVehicle(carID int, route Route, splines []Spline) Car {
 		OvertakeCooldown:     rand.Float32() * overtakeCooldownS,
 		VehicleKind:          route.VehicleKind,
 	}
+	wbFrac := car.WheelbaseFrac()
 	if spline, ok := findSplinePtrByID(splines, route.StartSplineID); ok {
 		frontPos, tangent := sampleSplineAtDistance(spline, 0)
-		car.RearPosition = vecSub(frontPos, vecScale(tangent, car.Length*wheelbaseFrac))
+		car.RearPosition = vecSub(frontPos, vecScale(tangent, car.Length*wbFrac))
+		car.PrevFrontPosition = frontPos
+		car.Heading = tangent
 
 		if model.Trailer != nil {
 			tLen := model.Trailer.LengthM / metersPerUnit
 			tWid := model.Trailer.WidthM / metersPerUnit
-			trailerRear := vecSub(car.RearPosition, vecScale(tangent, tLen*wheelbaseFrac))
+			trailerRear := vecSub(car.RearPosition, vecScale(tangent, tLen*wbFrac))
 			r, g, b := car.Color.R, car.Color.G, car.Color.B
 			car.Trailer = Trailer{
 				HasTrailer:   true,
@@ -3760,6 +3807,7 @@ func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []Tr
 	active := true
 	var sampleCursor splineSampleCursor
 	sampleCursor.splineID = -1
+	wbFrac := simCar.WheelbaseFrac()
 
 	if speed <= 0.01 {
 		spline, ok := graph.splinePtrByID(simCar.CurrentSplineID)
@@ -3771,9 +3819,9 @@ func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []Tr
 		frontPos := vecAdd(splinePos, vecScale(rightNormal, simCar.LateralOffset))
 		rearToFront := vecSub(frontPos, simRearPos)
 		if vectorLengthSq(rearToFront) > 1e-9 {
-			simRearPos = vecSub(frontPos, vecScale(normalize(rearToFront), simCar.Length*wheelbaseFrac))
+			simRearPos = vecSub(frontPos, vecScale(normalize(rearToFront), simCar.Length*wbFrac))
 		} else {
-			simRearPos = vecSub(frontPos, vecScale(splineTangent, simCar.Length*wheelbaseFrac))
+			simRearPos = vecSub(frontPos, vecScale(splineTangent, simCar.Length*wbFrac))
 		}
 		center := vecScale(vecAdd(frontPos, simRearPos), 0.5)
 		bodyHeading := normalize(vecSub(frontPos, simRearPos))
@@ -3788,9 +3836,9 @@ func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []Tr
 			hitchPos := simRearPos
 			trailerRearToHitch := vecSub(hitchPos, simTrailerRearPos)
 			if vectorLengthSq(trailerRearToHitch) > 1e-9 {
-				simTrailerRearPos = vecSub(hitchPos, vecScale(normalize(trailerRearToHitch), simCar.Trailer.Length*wheelbaseFrac))
+				simTrailerRearPos = vecSub(hitchPos, vecScale(normalize(trailerRearToHitch), simCar.Trailer.Length*wbFrac))
 			} else {
-				simTrailerRearPos = vecSub(hitchPos, vecScale(splineTangent, simCar.Trailer.Length*wheelbaseFrac))
+				simTrailerRearPos = vecSub(hitchPos, vecScale(splineTangent, simCar.Trailer.Length*wbFrac))
 			}
 			baseSample.HasTrailer = true
 			baseSample.TrailerPosition = vecScale(vecAdd(hitchPos, simTrailerRearPos), 0.5)
@@ -3811,10 +3859,10 @@ func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []Tr
 			break
 		}
 		splinePos, splineTangent, κ := sampleSplineStateAtDistance(spline, simCar.DistanceOnSpline, &sampleCursor)
-		wb := simCar.Length * wheelbaseFrac
+		wb := simCar.Length * wbFrac
 		targetOffset := κ * wb * wb / 6
 		if simCar.Trailer.HasTrailer {
-			trailerWb := simCar.Trailer.Length * wheelbaseFrac
+			trailerWb := simCar.Trailer.Length * wbFrac
 			targetOffset = κ * (wb*wb + trailerWb*trailerWb) / 6
 		}
 		lerpRate := speed / (2 * (wb + 0.01))
@@ -3823,9 +3871,9 @@ func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []Tr
 		frontPos := vecAdd(splinePos, vecScale(rightNormal, simCar.LateralOffset))
 		rearToFront := vecSub(frontPos, simRearPos)
 		if vectorLengthSq(rearToFront) > 1e-9 {
-			simRearPos = vecSub(frontPos, vecScale(normalize(rearToFront), simCar.Length*wheelbaseFrac))
+			simRearPos = vecSub(frontPos, vecScale(normalize(rearToFront), simCar.Length*wbFrac))
 		} else {
-			simRearPos = vecSub(frontPos, vecScale(splineTangent, simCar.Length*wheelbaseFrac))
+			simRearPos = vecSub(frontPos, vecScale(splineTangent, simCar.Length*wbFrac))
 		}
 		center := vecScale(vecAdd(frontPos, simRearPos), 0.5)
 		bodyHeading := normalize(vecSub(frontPos, simRearPos))
@@ -3842,9 +3890,9 @@ func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []Tr
 			hitchPos := simRearPos
 			trailerRearToHitch := vecSub(hitchPos, simTrailerRearPos)
 			if vectorLengthSq(trailerRearToHitch) > 1e-9 {
-				simTrailerRearPos = vecSub(hitchPos, vecScale(normalize(trailerRearToHitch), simCar.Trailer.Length*wheelbaseFrac))
+				simTrailerRearPos = vecSub(hitchPos, vecScale(normalize(trailerRearToHitch), simCar.Trailer.Length*wbFrac))
 			} else {
-				simTrailerRearPos = vecSub(hitchPos, vecScale(splineTangent, simCar.Trailer.Length*wheelbaseFrac))
+				simTrailerRearPos = vecSub(hitchPos, vecScale(splineTangent, simCar.Trailer.Length*wbFrac))
 			}
 			trailerCenter := vecScale(vecAdd(hitchPos, simTrailerRearPos), 0.5)
 			trailerHeading := normalize(vecSub(hitchPos, simTrailerRearPos))
@@ -4319,10 +4367,11 @@ func applyCurrentSplineSpeedUpdate(car *Car, route Route, currentSpline *Spline,
 
 func settleCarOnCurrentSpline(car Car, currentSpline *Spline, dt float32, sampleCursor *splineSampleCursor) Car {
 	splinePos, tangent, κ := sampleSplineStateAtDistance(currentSpline, car.DistanceOnSpline, sampleCursor)
-	wb := car.Length * wheelbaseFrac
+	wbFrac := car.WheelbaseFrac()
+	wb := car.Length * wbFrac
 	targetOffset := κ * wb * wb / 6
 	if car.Trailer.HasTrailer {
-		trailerWb := car.Trailer.Length * wheelbaseFrac
+		trailerWb := car.Trailer.Length * wbFrac
 		targetOffset = κ * (wb*wb + trailerWb*trailerWb) / 6
 	}
 	lerpRate := car.Speed / (2 * (wb + 0.01))
@@ -4332,13 +4381,25 @@ func settleCarOnCurrentSpline(car Car, currentSpline *Spline, dt float32, sample
 	frontPos := vecAdd(splinePos, vecScale(rightNormal, car.LateralOffset))
 	rearToFront := vecSub(frontPos, car.RearPosition)
 	if vectorLengthSq(rearToFront) > 1e-9 {
-		car.RearPosition = vecSub(frontPos, vecScale(normalize(rearToFront), car.Length*wheelbaseFrac))
+		car.RearPosition = vecSub(frontPos, vecScale(normalize(rearToFront), car.Length*wbFrac))
 	}
+	// Heading tracks the actual direction the front pivot is moving in,
+	// derived from this step's displacement. On a curve this differs from
+	// the body axis (rear→front) because the pivot is travelling along
+	// the spline tangent. Falls back to the spline tangent when the
+	// displacement is too small to be reliable (idle/just-spawned).
+	displacement := vecSub(frontPos, car.PrevFrontPosition)
+	if vectorLengthSq(displacement) > 1e-12 {
+		car.Heading = normalize(displacement)
+	} else if vectorLengthSq(car.Heading) <= 1e-9 {
+		car.Heading = tangent
+	}
+	car.PrevFrontPosition = frontPos
 	if car.Trailer.HasTrailer {
 		hitchPos := car.RearPosition
 		trailerRearToHitch := vecSub(hitchPos, car.Trailer.RearPosition)
 		if vectorLengthSq(trailerRearToHitch) > 1e-9 {
-			car.Trailer.RearPosition = vecSub(hitchPos, vecScale(normalize(trailerRearToHitch), car.Trailer.Length*wheelbaseFrac))
+			car.Trailer.RearPosition = vecSub(hitchPos, vecScale(normalize(trailerRearToHitch), car.Trailer.Length*wbFrac))
 		}
 	}
 	return car

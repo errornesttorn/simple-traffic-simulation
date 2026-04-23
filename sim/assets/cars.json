@@ -7,7 +7,9 @@
       "width_m": 1.80,
       "max_speed_mps": 28.0,
       "accel": 3.2,
-      "curve_speed_multiplier": 1.00
+      "curve_speed_multiplier": 1.00,
+      "front_pivot_frac": 0.22,
+      "rear_pivot_frac": 0.78
     },
     {
       "id": "sedan_a",
@@ -16,7 +18,9 @@
       "width_m": 1.85,
       "max_speed_mps": 32.5,
       "accel": 3.5,
-      "curve_speed_multiplier": 1.00
+      "curve_speed_multiplier": 1.00,
+      "front_pivot_frac": 0.20,
+      "rear_pivot_frac": 0.80
     },
     {
       "id": "sedan_b",
@@ -25,7 +29,9 @@
       "width_m": 1.90,
       "max_speed_mps": 36.1,
       "accel": 4.2,
-      "curve_speed_multiplier": 1.05
+      "curve_speed_multiplier": 1.05,
+      "front_pivot_frac": 0.18,
+      "rear_pivot_frac": 0.82
     },
     {
       "id": "suv_a",
@@ -34,7 +40,9 @@
       "width_m": 1.95,
       "max_speed_mps": 30.0,
       "accel": 3.0,
-      "curve_speed_multiplier": 0.92
+      "curve_speed_multiplier": 0.92,
+      "front_pivot_frac": 0.21,
+      "rear_pivot_frac": 0.79
     },
     {
       "id": "suv_b",
@@ -43,7 +51,9 @@
       "width_m": 2.00,
       "max_speed_mps": 27.8,
       "accel": 2.8,
-      "curve_speed_multiplier": 0.88
+      "curve_speed_multiplier": 0.88,
+      "front_pivot_frac": 0.20,
+      "rear_pivot_frac": 0.80
     },
     {
       "id": "coupe_sport",
@@ -52,7 +62,9 @@
       "width_m": 1.90,
       "max_speed_mps": 36.1,
       "accel": 4.5,
-      "curve_speed_multiplier": 1.15
+      "curve_speed_multiplier": 1.15,
+      "front_pivot_frac": 0.17,
+      "rear_pivot_frac": 0.83
     },
     {
       "id": "wagon",
@@ -61,7 +73,9 @@
       "width_m": 1.88,
       "max_speed_mps": 30.5,
       "accel": 3.1,
-      "curve_speed_multiplier": 0.98
+      "curve_speed_multiplier": 0.98,
+      "front_pivot_frac": 0.20,
+      "rear_pivot_frac": 0.78
     },
     {
       "id": "van_small",
@@ -70,7 +84,9 @@
       "width_m": 2.05,
       "max_speed_mps": 25.0,
       "accel": 2.4,
-      "curve_speed_multiplier": 0.90
+      "curve_speed_multiplier": 0.90,
+      "front_pivot_frac": 0.13,
+      "rear_pivot_frac": 0.85
     },
     {
       "id": "pickup_trailer",
@@ -80,6 +96,8 @@
       "max_speed_mps": 22.2,
       "accel": 2.0,
       "curve_speed_multiplier": 0.85,
+      "front_pivot_frac": 0.17,
+      "rear_pivot_frac": 0.78,
       "trailer": {
         "length_m": 6.5,
         "width_m": 2.25
@@ -93,6 +111,8 @@
       "max_speed_mps": 20.8,
       "accel": 1.8,
       "curve_speed_multiplier": 0.82,
+      "front_pivot_frac": 0.20,
+      "rear_pivot_frac": 0.80,
       "trailer": {
         "length_m": 5.5,
         "width_m": 2.20

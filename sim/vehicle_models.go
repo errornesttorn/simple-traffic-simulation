@@ -18,6 +18,13 @@ type VehicleTrailerModel struct {
 // VehicleModel describes a single car or bus "make"/variant. Spawned vehicles
 // inherit every physical parameter from the model so future rendering code can
 // pick a texture/mesh by ID without inferring from loose numeric fields.
+//
+// FrontPivotFrac and RearPivotFrac are the longitudinal positions of the
+// spline-following point and the dragged rear point as fractions of the
+// vehicle length, measured from the front bumper. Their difference is the
+// effective wheelbase as a fraction of length. Smaller fractions mean shorter
+// overhangs (more cab-forward designs like vans/buses); larger fractions mean
+// longer overhangs (typical hatchbacks).
 type VehicleModel struct {
 	ID                   string               `json:"id"`
 	DisplayName          string               `json:"display_name,omitempty"`
@@ -26,6 +33,8 @@ type VehicleModel struct {
 	MaxSpeedMPS          float32              `json:"max_speed_mps"`
 	Accel                float32              `json:"accel"`
 	CurveSpeedMultiplier float32              `json:"curve_speed_multiplier"`
+	FrontPivotFrac       float32              `json:"front_pivot_frac"`
+	RearPivotFrac        float32              `json:"rear_pivot_frac"`
 	Trailer              *VehicleTrailerModel `json:"trailer,omitempty"`
 }
 
@@ -71,6 +80,12 @@ func parseVehicleModels(data []byte, label string) ([]VehicleModel, error) {
 		}
 		if m.CurveSpeedMultiplier <= 0 {
 			file.Models[i].CurveSpeedMultiplier = 1.0
+		}
+		if m.FrontPivotFrac <= 0 || m.FrontPivotFrac >= 1 ||
+			m.RearPivotFrac <= 0 || m.RearPivotFrac >= 1 ||
+			m.RearPivotFrac <= m.FrontPivotFrac {
+			return nil, fmt.Errorf("%s: model %q has invalid pivot fractions front=%.3f rear=%.3f (need 0 < front < rear < 1)",
+				label, m.ID, m.FrontPivotFrac, m.RearPivotFrac)
 		}
 	}
 	return file.Models, nil
@@ -167,6 +182,8 @@ func fallbackVehicleModel(kind VehicleKind) VehicleModel {
 			MaxSpeedMPS:          17.0,
 			Accel:                1.5,
 			CurveSpeedMultiplier: 0.95,
+			FrontPivotFrac:       defaultFrontPivotFrac,
+			RearPivotFrac:        defaultRearPivotFrac,
 		}
 	}
 	return VehicleModel{
@@ -177,5 +194,7 @@ func fallbackVehicleModel(kind VehicleKind) VehicleModel {
 		MaxSpeedMPS:          30.0,
 		Accel:                3.5,
 		CurveSpeedMultiplier: 1.0,
+		FrontPivotFrac:       defaultFrontPivotFrac,
+		RearPivotFrac:        defaultRearPivotFrac,
 	}
 }
