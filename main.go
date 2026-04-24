@@ -3,9 +3,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +19,14 @@ import (
 
 	rl "github.com/gen2brain/raylib-go/raylib"
 )
+
+type BackgroundImage struct {
+	Path     string
+	Texture  rl.Texture2D
+	Position rl.Vector2
+	Scale    float32
+	Rotation float32
+}
 
 type EditorMode int
 type EditorTool int
@@ -33,6 +44,7 @@ const (
 	ModeTraffic
 	ModePedestrian
 	ModeDriving
+	ModeImage
 )
 
 const (
@@ -51,6 +63,8 @@ const (
 	ToolTrafficLight
 	ToolDrive
 	ToolPedestrianPath
+	ToolImage
+	ToolImageImport
 )
 
 const (
@@ -574,6 +588,7 @@ var modeToolbarItems = []modeToolbarItem{
 	{"Tr", "Traffic", ModeTraffic, false, false, false},
 	{"Pd", "Ped", ModePedestrian, false, false, false},
 	{"G", "Drive", ModeDriving, false, false, false},
+	{"Im", "Image", ModeImage, false, false, false},
 	{"I", "Info", 0, false, false, true},
 	{"D", "Debug", 0, true, false, false},
 	{"H", "Hitbox", 0, false, true, false},
@@ -606,6 +621,11 @@ var trafficToolItems = []toolToolbarItem{
 
 var drivingToolItems = []toolToolbarItem{
 	{"G", "Drive", ToolDrive},
+}
+
+var imageToolItems = []toolToolbarItem{
+	{"I", "Select", ToolImage},
+	{"O", "Import", ToolImageImport},
 }
 
 var pedestrianToolItems = []toolToolbarItem{
@@ -664,6 +684,8 @@ func modeForTool(tool EditorTool) EditorMode {
 		return ModePedestrian
 	case ToolDrive:
 		return ModeDriving
+	case ToolImage, ToolImageImport:
+		return ModeImage
 	default:
 		return ModeDraw
 	}
@@ -683,6 +705,8 @@ func defaultToolForMode(mode EditorMode) EditorTool {
 		return ToolPedestrianPath
 	case ModeDriving:
 		return ToolDrive
+	case ModeImage:
+		return ToolImage
 	default:
 		return ToolSpline
 	}
@@ -696,7 +720,7 @@ func isMouseOverToolbar(mouse Vec2) bool {
 		return true
 	}
 	toolN := 0
-	for _, mode := range []EditorMode{ModeDraw, ModeRules, ModeRoute, ModeTraffic, ModePedestrian, ModeDriving} {
+	for _, mode := range []EditorMode{ModeDraw, ModeRules, ModeRoute, ModeTraffic, ModePedestrian, ModeDriving, ModeImage} {
 		if n := len(toolsForMode(mode)); n > toolN {
 			toolN = n
 		}
@@ -737,6 +761,15 @@ func main() {
 	)
 
 	world := simpkg.NewWorld()
+	bgImages := []BackgroundImage{}
+	bgSelectedImg := -1
+	bgDragging := false
+	bgScaling := false
+	bgRotating := false
+	bgDragStartMouse := rl.NewVector2(0, 0)
+	bgDragStartPos := rl.NewVector2(0, 0)
+	bgStartScale := float32(1.0)
+	bgStartRotation := float32(0.0)
 	playerCar := playerCarState{}
 	driveRestoreTarget := rl.NewVector2(0, 0)
 
@@ -841,6 +874,8 @@ func main() {
 				setMode(ModePedestrian)
 			case ModePedestrian:
 				setMode(ModeDriving)
+			case ModeDriving:
+				setMode(ModeImage)
 			default:
 				setMode(ModeDraw)
 			}
@@ -916,8 +951,12 @@ func main() {
 				if err := world.Save(path); err != nil {
 					noticeText = fmt.Sprintf("Save failed: %v", err)
 				} else {
-					noticeText = fmt.Sprintf("Saved %d splines, %d routes, %d cars, %d lights to %s",
-						len(world.Splines), len(world.Routes), len(world.Cars), len(world.TrafficLights), path)
+					if err := saveImagesToJson(path, bgImages); err != nil {
+						noticeText = fmt.Sprintf("Saved world, but failed to save images: %v", err)
+					} else {
+						noticeText = fmt.Sprintf("Saved %d splines, %d routes, %d cars, %d lights, %d images to %s",
+							len(world.Splines), len(world.Routes), len(world.Cars), len(world.TrafficLights), len(bgImages), path)
+					}
 				}
 				noticeTimer = 3.0
 			}
@@ -928,40 +967,81 @@ func main() {
 				noticeText = fmt.Sprintf("Load failed: %v", err)
 				noticeTimer = 3.0
 			} else if path != "" {
-				loadedWorld, err := simpkg.LoadWorld(path)
-				if err != nil {
-					noticeText = fmt.Sprintf("Load failed: %v", err)
+				ext := strings.ToLower(filepath.Ext(path))
+				if ext == ".png" || ext == ".jpg" || ext == ".jpeg" {
+					tex := rl.LoadTexture(path)
+					if tex.ID > 0 {
+						bgImages = append(bgImages, BackgroundImage{
+							Path:     path,
+							Texture:  tex,
+							Position: camera.Target,
+							Scale:    1.0,
+							Rotation: 0.0,
+						})
+						bgSelectedImg = len(bgImages) - 1
+						setMode(ModeImage)
+						noticeText = fmt.Sprintf("Imported image: %s", filepath.Base(path))
+					} else {
+						noticeText = fmt.Sprintf("Failed to load image: %s", filepath.Base(path))
+					}
 					noticeTimer = 3.0
 				} else {
-					world = *loadedWorld
-					paused = true
-					editorMutatedWorld = true
-					stage = StageIdle
-					draft = newDraft()
-					quadraticDraft = newQuadraticDraft()
-					cutDraft = newCutDraft()
-					pedestrianDraft = pedestrianPathDraft{}
-					routePanel = RoutePanel{}
-					routeStartSplineID = -1
-					coupleModeFirstID = -1
-					editingCycleID = -1
-					editingLights = false
-					editingPhaseIdx = -1
-					showPhaseIdx = -1
-					activeDurInput = -1
-					durInputStr = ""
-					pendingLights = pendingLights[:0]
-					lastPref = maxLoadedPreference(world.Splines)
-					noticeText = fmt.Sprintf("Loaded %d splines, %d routes, %d cars, %d lights from %s",
-						len(world.Splines), len(world.Routes), len(world.Cars), len(world.TrafficLights), path)
-					noticeTimer = 3.0
+					loadedWorld, err := simpkg.LoadWorld(path)
+					if err != nil {
+						noticeText = fmt.Sprintf("Load failed: %v", err)
+						noticeTimer = 3.0
+					} else {
+						world = *loadedWorld
+						paused = true
+						editorMutatedWorld = true
+						stage = StageIdle
+						draft = newDraft()
+						quadraticDraft = newQuadraticDraft()
+						cutDraft = newCutDraft()
+						pedestrianDraft = pedestrianPathDraft{}
+						routePanel = RoutePanel{}
+						routeStartSplineID = -1
+						coupleModeFirstID = -1
+						editingCycleID = -1
+						editingLights = false
+						editingPhaseIdx = -1
+						showPhaseIdx = -1
+						activeDurInput = -1
+						durInputStr = ""
+						pendingLights = pendingLights[:0]
+						lastPref = maxLoadedPreference(world.Splines)
+
+						bgImages = []BackgroundImage{}
+						bgSelectedImg = -1
+						data, err := os.ReadFile(path)
+						if err == nil {
+							var extra struct {
+								Images []SavedImage `json:"images"`
+							}
+							if json.Unmarshal(data, &extra) == nil {
+								imgDir := filepath.Dir(path)
+								for _, si := range extra.Images {
+									imgPath := filepath.Join(imgDir, si.Path)
+									tex := rl.LoadTexture(imgPath)
+									if tex.ID > 0 {
+										bgImages = append(bgImages, BackgroundImage{
+											Path:     imgPath,
+											Texture:  tex,
+											Position: rl.NewVector2(si.X, si.Y),
+											Scale:    si.Scale,
+											Rotation: si.Rotation,
+										})
+									}
+								}
+							}
+						}
+
+						noticeText = fmt.Sprintf("Loaded %d splines, %d routes, %d cars, %d lights, %d images from %s",
+							len(world.Splines), len(world.Routes), len(world.Cars), len(world.TrafficLights), len(bgImages), path)
+						noticeTimer = 3.0
+					}
 				}
 			}
-		}
-
-		wheel := rl.GetMouseWheelMove()
-		if wheel != 0 {
-			zoomCameraToMouse(&camera, wheel)
 		}
 
 		if mode == ModeDriving && !playerCar.Active {
@@ -985,6 +1065,20 @@ func main() {
 		mouseScreen := fromRLVec2(mouseScreenRL)
 		mouseWorld := fromRLVec2(rl.GetScreenToWorld2D(mouseScreenRL, camera))
 		mouseOnToolbar := isMouseOverToolbar(mouseScreen)
+
+		wheel := rl.GetMouseWheelMove()
+		if wheel != 0 {
+			if mode == ModeImage && bgSelectedImg >= 0 && !mouseOnToolbar {
+				img := &bgImages[bgSelectedImg]
+				if wheel > 0 {
+					img.Scale *= 1.1
+				} else {
+					img.Scale /= 1.1
+				}
+			} else {
+				zoomCameraToMouse(&camera, wheel)
+			}
+		}
 
 		// Toolbar click — switch mode / toggle debug
 		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) && mouseOnToolbar {
@@ -1238,6 +1332,83 @@ func main() {
 				if changed {
 					editorMutatedWorld = true
 					pedestrianTopologyChanged = true
+				}
+			case ToolImage:
+				if rl.IsMouseButtonPressed(rl.MouseButtonLeft) || rl.IsMouseButtonPressed(rl.MouseButtonRight) {
+					bgSelectedImg = -1
+					for i := len(bgImages) - 1; i >= 0; i-- {
+						img := bgImages[i]
+						dx := mouseWorld.X - img.Position.X
+						dy := mouseWorld.Y - img.Position.Y
+						rad := -img.Rotation * math.Pi / 180.0
+						lx := float32(float64(dx)*math.Cos(float64(rad)) - float64(dy)*math.Sin(float64(rad)))
+						ly := float32(float64(dx)*math.Sin(float64(rad)) + float64(dy)*math.Cos(float64(rad)))
+						w := float32(img.Texture.Width) * img.Scale
+						h := float32(img.Texture.Height) * img.Scale
+						if lx >= -w/2 && lx <= w/2 && ly >= -h/2 && ly <= h/2 {
+							bgSelectedImg = i
+							bgDragStartMouse = toRLVec2(mouseWorld)
+							bgDragStartPos = img.Position
+							bgStartScale = img.Scale
+							bgStartRotation = img.Rotation
+							if rl.IsMouseButtonPressed(rl.MouseButtonRight) {
+								bgRotating = true
+							} else if isCtrlDown() {
+								bgScaling = true
+							} else if isShiftDown() {
+								bgRotating = true
+							} else {
+								bgDragging = true
+							}
+							break
+						}
+					}
+				}
+
+				if bgDragging || bgScaling || bgRotating {
+					if (bgRotating && rl.IsMouseButtonReleased(rl.MouseButtonRight)) || (!bgRotating && rl.IsMouseButtonReleased(rl.MouseButtonLeft)) {
+						bgDragging = false
+						bgScaling = false
+						bgRotating = false
+					} else if (bgRotating && rl.IsMouseButtonDown(rl.MouseButtonRight)) || (!bgRotating && rl.IsMouseButtonDown(rl.MouseButtonLeft)) {
+						if bgSelectedImg >= 0 {
+							img := &bgImages[bgSelectedImg]
+							if bgDragging {
+								img.Position.X = float32(bgDragStartPos.X) + float32(mouseWorld.X-bgDragStartMouse.X)
+								img.Position.Y = float32(bgDragStartPos.Y) + float32(mouseWorld.Y-bgDragStartMouse.Y)
+							} else if bgScaling {
+								distStart := float32(math.Sqrt(float64(distSq(fromRLVec2(bgDragStartMouse), fromRLVec2(bgDragStartPos)))))
+								distCurr := float32(math.Sqrt(float64(distSq(mouseWorld, fromRLVec2(bgDragStartPos)))))
+								if distStart > 0.1 {
+									img.Scale = bgStartScale * (distCurr / distStart)
+								}
+							} else if bgRotating {
+								angleStart := float32(math.Atan2(float64(bgDragStartMouse.Y-bgDragStartPos.Y), float64(bgDragStartMouse.X-bgDragStartPos.X)))
+								angleCurr := float32(math.Atan2(float64(mouseWorld.Y-bgDragStartPos.Y), float64(mouseWorld.X-bgDragStartPos.X)))
+								img.Rotation = bgStartRotation + (angleCurr-angleStart)*180.0/math.Pi
+							}
+						}
+					}
+				} else if bgSelectedImg >= 0 {
+					if rl.IsKeyPressed(rl.KeyDelete) || rl.IsKeyPressed(rl.KeyBackspace) {
+						bgImages = append(bgImages[:bgSelectedImg], bgImages[bgSelectedImg+1:]...)
+						bgSelectedImg = -1
+						bgDragging = false
+					} else {
+						img := &bgImages[bgSelectedImg]
+						if rl.IsKeyDown(rl.KeyUp) {
+							img.Scale *= 1.01
+						}
+						if rl.IsKeyDown(rl.KeyDown) {
+							img.Scale /= 1.01
+						}
+						if rl.IsKeyDown(rl.KeyLeft) {
+							img.Rotation -= 1.0
+						}
+						if rl.IsKeyDown(rl.KeyRight) {
+							img.Rotation += 1.0
+						}
+					}
 				}
 			case ToolTrafficLight:
 				phaseCount := 0
@@ -1542,6 +1713,20 @@ func main() {
 		viewRect := cameraWorldRect(camera, pixelsToWorld(camera.Zoom, 64))
 		drawGrid(camera)
 		drawAxes(camera)
+
+		for i, img := range bgImages {
+			tint := rl.White
+			if mode == ModeImage && i == bgSelectedImg {
+				tint = rl.NewColor(255, 230, 230, 255)
+			}
+			srcRec := rl.NewRectangle(0, 0, float32(img.Texture.Width), float32(img.Texture.Height))
+			dstRec := rl.NewRectangle(img.Position.X, img.Position.Y, float32(img.Texture.Width)*img.Scale, float32(img.Texture.Height)*img.Scale)
+			origin := rl.NewVector2(dstRec.Width/2, dstRec.Height/2)
+			rl.DrawTexturePro(img.Texture, srcRec, dstRec, origin, img.Rotation, tint)
+			if mode == ModeImage && i == bgSelectedImg {
+				rl.DrawRectangleLinesEx(rl.NewRectangle(img.Position.X-origin.X, img.Position.Y-origin.Y, dstRec.Width, dstRec.Height), 2.0/camera.Zoom, rl.Red)
+			}
+		}
 
 		drawPedestrianPaths(pedestrianPaths, viewRect)
 		if tool == ToolPedestrianPath {
@@ -5016,6 +5201,8 @@ func modeName(mode EditorMode) string {
 		return "Pedestrian"
 	case ModeDriving:
 		return "Drive"
+	case ModeImage:
+		return "Image"
 	default:
 		return "Unknown"
 	}
@@ -5053,6 +5240,8 @@ func toolName(tool EditorTool) string {
 		return "Drive"
 	case ToolPedestrianPath:
 		return "Ped Path"
+	case ToolImage:
+		return "Image"
 	default:
 		return "Unknown"
 	}
@@ -5143,6 +5332,13 @@ func hudInfoLines(mode EditorMode, tool EditorTool, stage Stage, draft Draft, qu
 			"Pedestrian path tool: left click places the first edge of a 4 m-wide path, second left click places the opposite edge and commits it.",
 			"Endpoints snap to existing pedestrian path endpoints within a small radius, so multiple paths can share a junction.",
 			"Right click with a draft in progress cancels it; right click on a hovered path removes that path.",
+		)
+	case ToolImage:
+		controls = append(controls,
+			"Image tool: left click and drag to move the selected image.",
+			"Scaling: use mouse wheel or hold Ctrl and drag away/towards center.",
+			"Rotation: right click and drag or hold Shift and drag around center.",
+			"Keyboard: use arrow keys for fine-tuned scaling and rotation. Delete or Backspace removes the selected image.",
 		)
 	default:
 		controls = append(controls, fmt.Sprintf("%s mode: use the toolbar or shortcuts to switch to a tool for editing.", modeName(mode)))
@@ -6099,6 +6295,10 @@ func isCtrlDown() bool {
 	return rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)
 }
 
+func isShiftDown() bool {
+	return rl.IsKeyDown(rl.KeyLeftShift) || rl.IsKeyDown(rl.KeyRightShift)
+}
+
 func nodeKeyFromVec2(v Vec2) simpkg.NodeKey {
 	return simpkg.NodeKey{
 		int32(math.Round(float64(v.X * 100))),
@@ -6543,4 +6743,58 @@ func segmentVisibleInWorldRect(a, b Vec2, thickness float32, viewRect worldRect)
 		return false
 	}
 	return true
+}
+
+type SavedImage struct {
+	Path     string  `json:"path"`
+	X        float32 `json:"x"`
+	Y        float32 `json:"y"`
+	Scale    float32 `json:"scale"`
+	Rotation float32 `json:"rotation"`
+}
+
+func saveImagesToJson(jsonPath string, images []BackgroundImage) error {
+	if len(images) == 0 {
+		return nil
+	}
+
+	data, err := os.ReadFile(jsonPath)
+	if err != nil {
+		return err
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	jsonDir := filepath.Dir(jsonPath)
+
+	var savedImages []SavedImage
+	for _, img := range images {
+		baseName := filepath.Base(img.Path)
+		destPath := filepath.Join(jsonDir, baseName)
+
+		if img.Path != destPath {
+			imgData, err := os.ReadFile(img.Path)
+			if err == nil {
+				os.WriteFile(destPath, imgData, 0644)
+			}
+		}
+
+		savedImages = append(savedImages, SavedImage{
+			Path:     baseName,
+			X:        float32(img.Position.X),
+			Y:        float32(img.Position.Y),
+			Scale:    float32(img.Scale),
+			Rotation: float32(img.Rotation),
+		})
+	}
+
+	raw["images"] = savedImages
+
+	outData, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(jsonPath, outData, 0644)
 }

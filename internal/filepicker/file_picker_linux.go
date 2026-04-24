@@ -31,7 +31,7 @@ func pickFileWithZenity(save bool, defaultPath string) (string, error) {
 	if save {
 		args = append(args, "--save", "--confirm-overwrite")
 	}
-	args = append(args, "--filename="+defaultPath, "--file-filter=Spline JSON | *.json")
+	args = append(args, "--filename="+defaultPath, "--file-filter=Supported files | *.json *.png *.jpg *.jpeg")
 	return runDialogCommand("zenity", args...)
 }
 
@@ -40,12 +40,12 @@ func pickFileWithYad(save bool, defaultPath string) (string, error) {
 	if save {
 		args = append(args, "--save", "--confirm-overwrite")
 	}
-	args = append(args, "--filename="+defaultPath, "--file-filter=*.json")
+	args = append(args, "--filename="+defaultPath, "--file-filter=Supported files | *.json *.png *.jpg *.jpeg")
 	return runDialogCommand("yad", args...)
 }
 
 func pickFileWithKDialog(save bool, defaultPath string) (string, error) {
-	filter := "JSON files (*.json)"
+	filter := "Supported files (*.json *.png *.jpg *.jpeg)"
 	if save {
 		return runDialogCommand("kdialog", "--getsavefilename", defaultPath, filter)
 	}

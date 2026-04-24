@@ -32,7 +32,7 @@ func buildPowerShellDialogScript(save bool, defaultPath string) string {
 	dialogType := "OpenFileDialog"
 	resultValue := "[System.Windows.Forms.DialogResult]::OK"
 	config := []string{
-		"$dialog.Filter = 'JSON files (*.json)|*.json'",
+		"$dialog.Filter = 'Supported files (*.json;*.png;*.jpg;*.jpeg)|*.json;*.png;*.jpg;*.jpeg|All files (*.*)|*.*'",
 		"$dialog.InitialDirectory = '" + quotePowerShellString(initialDir) + "'",
 		"$dialog.FileName = '" + quotePowerShellString(defaultName) + "'",
 	}
