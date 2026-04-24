@@ -770,6 +770,12 @@ func main() {
 	bgDragStartPos := rl.NewVector2(0, 0)
 	bgStartScale := float32(1.0)
 	bgStartRotation := float32(0.0)
+
+	mapTiles := []MapTile{}
+	mapMode := false
+	mapDir := ""
+	mapJsonPath := ""
+	mapSimName := ""
 	playerCar := playerCarState{}
 	driveRestoreTarget := rl.NewVector2(0, 0)
 
@@ -943,22 +949,37 @@ func main() {
 		}
 		if isCtrlDown() && rl.IsKeyPressed(rl.KeyS) {
 			paused = true
-			path, err := filepicker.PickSplineFilePath(true)
-			if err != nil {
-				noticeText = fmt.Sprintf("Save failed: %v", err)
-				noticeTimer = 3.0
-			} else if path != "" {
-				if err := world.Save(path); err != nil {
+			if mapMode {
+				if mapSimName == "" {
+					mapSimName = "simulation.json"
+				}
+				simPath := filepath.Join(mapDir, mapSimName)
+				if err := world.Save(simPath); err != nil {
 					noticeText = fmt.Sprintf("Save failed: %v", err)
+				} else if err := updateMapJsonSimulationField(mapJsonPath, mapSimName); err != nil {
+					noticeText = fmt.Sprintf("Saved simulation, but map.json update failed: %v", err)
 				} else {
-					if err := saveImagesToJson(path, bgImages); err != nil {
-						noticeText = fmt.Sprintf("Saved world, but failed to save images: %v", err)
-					} else {
-						noticeText = fmt.Sprintf("Saved %d splines, %d routes, %d cars, %d lights, %d images to %s",
-							len(world.Splines), len(world.Routes), len(world.Cars), len(world.TrafficLights), len(bgImages), path)
-					}
+					noticeText = fmt.Sprintf("Saved map simulation to %s", simPath)
 				}
 				noticeTimer = 3.0
+			} else {
+				path, err := filepicker.PickSplineFilePath(true)
+				if err != nil {
+					noticeText = fmt.Sprintf("Save failed: %v", err)
+					noticeTimer = 3.0
+				} else if path != "" {
+					if err := world.Save(path); err != nil {
+						noticeText = fmt.Sprintf("Save failed: %v", err)
+					} else {
+						if err := saveImagesToJson(path, bgImages); err != nil {
+							noticeText = fmt.Sprintf("Saved world, but failed to save images: %v", err)
+						} else {
+							noticeText = fmt.Sprintf("Saved %d splines, %d routes, %d cars, %d lights, %d images to %s",
+								len(world.Splines), len(world.Routes), len(world.Cars), len(world.TrafficLights), len(bgImages), path)
+						}
+					}
+					noticeTimer = 3.0
+				}
 			}
 		}
 		if isCtrlDown() && rl.IsKeyPressed(rl.KeyO) {
@@ -968,7 +989,71 @@ func main() {
 				noticeTimer = 3.0
 			} else if path != "" {
 				ext := strings.ToLower(filepath.Ext(path))
-				if ext == ".png" || ext == ".jpg" || ext == ".jpeg" {
+				baseName := filepath.Base(path)
+				if baseName == "map.json" {
+					for _, t := range mapTiles {
+						if t.Texture.ID > 0 {
+							rl.UnloadTexture(t.Texture)
+						}
+					}
+					mapTiles = mapTiles[:0]
+					tiles, _, _, simName, _, mferr := loadMapFormat(path)
+					if mferr != nil {
+						noticeText = fmt.Sprintf("Map load failed: %v", mferr)
+						noticeTimer = 3.0
+					} else {
+						mapTiles = tiles
+						mapMode = true
+						mapJsonPath = path
+						mapDir = filepath.Dir(path)
+						mapSimName = simName
+						if mapSimName == "" {
+							mapSimName = "simulation.json"
+						}
+						for _, img := range bgImages {
+							if img.Texture.ID > 0 {
+								rl.UnloadTexture(img.Texture)
+							}
+						}
+						bgImages = bgImages[:0]
+						bgSelectedImg = -1
+
+						simPath := filepath.Join(mapDir, mapSimName)
+						if _, statErr := os.Stat(simPath); statErr == nil {
+							if lw, lerr := simpkg.LoadWorld(simPath); lerr == nil {
+								world = *lw
+							} else {
+								noticeText = fmt.Sprintf("Map tiles loaded, but simulation load failed: %v", lerr)
+								noticeTimer = 3.0
+							}
+						} else {
+							world = simpkg.NewWorld()
+						}
+						paused = true
+						editorMutatedWorld = true
+						stage = StageIdle
+						draft = newDraft()
+						quadraticDraft = newQuadraticDraft()
+						cutDraft = newCutDraft()
+						pedestrianDraft = pedestrianPathDraft{}
+						routePanel = RoutePanel{}
+						routeStartSplineID = -1
+						coupleModeFirstID = -1
+						editingCycleID = -1
+						editingLights = false
+						editingPhaseIdx = -1
+						showPhaseIdx = -1
+						activeDurInput = -1
+						durInputStr = ""
+						pendingLights = pendingLights[:0]
+						lastPref = maxLoadedPreference(world.Splines)
+
+						if noticeText == "" {
+							noticeText = fmt.Sprintf("Loaded map with %d tiles from %s", len(mapTiles), path)
+							noticeTimer = 3.0
+						}
+					}
+				} else if ext == ".png" || ext == ".jpg" || ext == ".jpeg" {
 					tex := rl.LoadTexture(path)
 					if tex.ID > 0 {
 						bgImages = append(bgImages, BackgroundImage{
@@ -991,6 +1076,16 @@ func main() {
 						noticeText = fmt.Sprintf("Load failed: %v", err)
 						noticeTimer = 3.0
 					} else {
+						for _, t := range mapTiles {
+							if t.Texture.ID > 0 {
+								rl.UnloadTexture(t.Texture)
+							}
+						}
+						mapTiles = mapTiles[:0]
+						mapMode = false
+						mapJsonPath = ""
+						mapDir = ""
+						mapSimName = ""
 						world = *loadedWorld
 						paused = true
 						editorMutatedWorld = true
@@ -1713,6 +1808,8 @@ func main() {
 		viewRect := cameraWorldRect(camera, pixelsToWorld(camera.Zoom, 64))
 		drawGrid(camera)
 		drawAxes(camera)
+
+		drawMapTiles(mapTiles)
 
 		for i, img := range bgImages {
 			tint := rl.White

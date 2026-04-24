@@ -31,7 +31,7 @@ func pickFileWithZenity(save bool, defaultPath string) (string, error) {
 	if save {
 		args = append(args, "--save", "--confirm-overwrite")
 	}
-	args = append(args, "--filename="+defaultPath, "--file-filter=Supported files | *.json *.png *.jpg *.jpeg")
+	args = append(args, "--filename="+defaultPath, "--file-filter=Supported files | *.json *.png *.jpg *.jpeg map.json")
 	return runDialogCommand("zenity", args...)
 }
 
@@ -40,7 +40,7 @@ func pickFileWithYad(save bool, defaultPath string) (string, error) {
 	if save {
 		args = append(args, "--save", "--confirm-overwrite")
 	}
-	args = append(args, "--filename="+defaultPath, "--file-filter=Supported files | *.json *.png *.jpg *.jpeg")
+	args = append(args, "--filename="+defaultPath, "--file-filter=Supported files | *.json *.png *.jpg *.jpeg map.json")
 	return runDialogCommand("yad", args...)
 }
 
