@@ -35,6 +35,8 @@ type Stage int
 
 type EndKind int
 
+type MoveHandleKind int
+
 type VehicleKind = simpkg.VehicleKind
 
 const (
@@ -50,6 +52,7 @@ const (
 const (
 	ToolSpline EditorTool = iota
 	ToolQuadratic
+	ToolMove
 	ToolCut
 	ToolReverse
 	ToolPriority
@@ -83,6 +86,14 @@ const (
 	EndNone EndKind = iota
 	EndStart
 	EndFinish
+)
+
+const (
+	MoveHandleNone MoveHandleKind = iota
+	MoveHandleJunction
+	MoveHandleP1
+	MoveHandleP2
+	MoveHandleM
 )
 
 const (
@@ -376,6 +387,24 @@ type CutDraft struct {
 	RightP [4]Vec2 // right half P0..P3
 }
 
+type MoveTarget struct {
+	Kind        MoveHandleKind
+	SplineIndex int
+	SplineID    int
+	NodeKey     simpkg.NodeKey
+	Point       Vec2
+}
+
+type MoveDraft struct {
+	Active           bool
+	SelectedSplineID int
+	Target           MoveTarget
+	OriginalSplines  []Spline
+	GrabOffset       Vec2
+	CurrentPoint     Vec2
+	Snap             GeometrySnap
+}
+
 type EndHit struct {
 	SplineIndex int
 	SplineID    int
@@ -597,6 +626,7 @@ var modeToolbarItems = []modeToolbarItem{
 var drawToolItems = []toolToolbarItem{
 	{"E", "Spline", ToolSpline},
 	{"Q", "Quad", ToolQuadratic},
+	{"M", "Move", ToolMove},
 	{"C", "Cut", ToolCut},
 	{"X", "Rev", ToolReverse},
 }
@@ -672,7 +702,7 @@ func toolsForMode(mode EditorMode) []toolToolbarItem {
 
 func modeForTool(tool EditorTool) EditorMode {
 	switch tool {
-	case ToolSpline, ToolQuadratic, ToolCut, ToolReverse:
+	case ToolSpline, ToolQuadratic, ToolMove, ToolCut, ToolReverse:
 		return ModeDraw
 	case ToolPriority, ToolCouple, ToolTurnLink, ToolSpeedLimit, ToolPreference:
 		return ModeRules
@@ -785,6 +815,7 @@ func main() {
 	draft := newDraft()
 	quadraticDraft := newQuadraticDraft()
 	cutDraft := newCutDraft()
+	moveDraft := newMoveDraft()
 	pedestrianDraft := pedestrianPathDraft{}
 	routePanel := RoutePanel{}
 	routeStartSplineID := -1
@@ -818,6 +849,7 @@ func main() {
 		draft = newDraft()
 		quadraticDraft = newQuadraticDraft()
 		cutDraft = newCutDraft()
+		moveDraft = newMoveDraft()
 		pedestrianDraft = pedestrianPathDraft{}
 		routePanel = RoutePanel{}
 		routeStartSplineID = -1
@@ -891,6 +923,9 @@ func main() {
 		}
 		if rl.IsKeyPressed(rl.KeyQ) {
 			setTool(ToolQuadratic)
+		}
+		if rl.IsKeyPressed(rl.KeyM) {
+			setTool(ToolMove)
 		}
 		if rl.IsKeyPressed(rl.KeyR) {
 			setTool(ToolRouteCars)
@@ -1035,6 +1070,7 @@ func main() {
 						draft = newDraft()
 						quadraticDraft = newQuadraticDraft()
 						cutDraft = newCutDraft()
+						moveDraft = newMoveDraft()
 						pedestrianDraft = pedestrianPathDraft{}
 						routePanel = RoutePanel{}
 						routeStartSplineID = -1
@@ -1093,6 +1129,7 @@ func main() {
 						draft = newDraft()
 						quadraticDraft = newQuadraticDraft()
 						cutDraft = newCutDraft()
+						moveDraft = newMoveDraft()
 						pedestrianDraft = pedestrianPathDraft{}
 						routePanel = RoutePanel{}
 						routeStartSplineID = -1
@@ -1322,6 +1359,18 @@ func main() {
 				if notice != "" {
 					noticeText = notice
 					noticeTimer = 3.0
+				}
+			case ToolMove:
+				var graphChanged bool
+				moveDraft, splines, graphChanged = handleMoveMode(moveDraft, splines, hoveredSpline, mouseWorld, camera.Zoom)
+				if graphChanged {
+					editorState.Splines = splines
+					editorState.Routes = routes
+					editorState.LaneChangeSplines = laneChangeSplines
+					editorState.handleRouteGraphChanged(false)
+					routes = editorState.Routes
+					laneChangeSplines = editorState.LaneChangeSplines
+					editorMutatedWorld = true
 				}
 			case ToolReverse:
 				var topologyChanged bool
@@ -1861,7 +1910,7 @@ func main() {
 				thickness = maxf(thickness, pixelsToWorld(camera.Zoom, 4))
 			}
 			if i == hoveredSpline {
-				if ((tool == ToolSpline || tool == ToolQuadratic) && stage == StageIdle) || tool == ToolPriority {
+				if ((tool == ToolSpline || tool == ToolQuadratic) && stage == StageIdle) || tool == ToolPriority || tool == ToolMove {
 					color = NewColor(242, 153, 74, 255)
 					thickness = pixelsToWorld(camera.Zoom, 5)
 				}
@@ -1921,6 +1970,9 @@ func main() {
 				drawQuadraticDraft(stage, quadraticDraft, previewMouse, camera.Zoom, geometrySnap)
 				drawSpline(preview, pixelsToWorld(camera.Zoom, 4), NewColor(214, 76, 76, 255))
 			}
+		}
+		if tool == ToolMove {
+			drawMoveMode(splines, moveDraft, hoveredSpline, mouseWorld, camera.Zoom, viewRect)
 		}
 		if tool == ToolReverse && hoveredSpline >= 0 {
 			drawSpline(splines[hoveredSpline], pixelsToWorld(camera.Zoom, 4), NewColor(255, 120, 40, 180))
@@ -2307,6 +2359,10 @@ func draftP3Preview(draft Draft, mouse Vec2, geometrySnap GeometrySnap) Vec2 {
 
 func newQuadraticDraft() QuadraticDraft {
 	return QuadraticDraft{}
+}
+
+func newMoveDraft() MoveDraft {
+	return MoveDraft{SelectedSplineID: -1}
 }
 
 func newQuadraticSpline(id int, p0, m, p3 Vec2) Spline {
@@ -2863,6 +2919,250 @@ func handlePreferenceMode(splines []Spline, hoveredSpline, lastPref int) ([]Spli
 		}
 	}
 	return splines, lastPref
+}
+
+func rebuildSplineWithPoints(old Spline, p0, p1, p2, p3 Vec2) Spline {
+	updated := old
+	updated.P0 = p0
+	updated.P1 = p1
+	updated.P2 = p2
+	updated.P3 = p3
+	simpkg.RebuildSpline(&updated)
+	return updated
+}
+
+func moveHandlePriority(kind MoveHandleKind) int {
+	switch kind {
+	case MoveHandleJunction:
+		return 0
+	case MoveHandleM:
+		return 1
+	case MoveHandleP1, MoveHandleP2:
+		return 2
+	default:
+		return 100
+	}
+}
+
+func findMoveTarget(splines []Spline, point Vec2, radius float32, handleSplineID int) MoveTarget {
+	best := MoveTarget{Kind: MoveHandleNone, SplineIndex: -1, SplineID: -1}
+	bestDistSq := radius * radius
+	bestPriority := moveHandlePriority(MoveHandleNone)
+	const distTieEps float32 = 1e-4
+
+	consider := func(kind MoveHandleKind, splineIndex int, handlePoint Vec2) {
+		d := distSq(point, handlePoint)
+		priority := moveHandlePriority(kind)
+		if d < bestDistSq-distTieEps || (absf(d-bestDistSq) <= distTieEps && priority < bestPriority) {
+			bestDistSq = d
+			bestPriority = priority
+			best = MoveTarget{
+				Kind:        kind,
+				SplineIndex: splineIndex,
+				SplineID:    splines[splineIndex].ID,
+				Point:       handlePoint,
+			}
+			if kind == MoveHandleJunction {
+				best.NodeKey = nodeKeyFromVec2(handlePoint)
+			}
+		}
+	}
+
+	for i, spline := range splines {
+		consider(MoveHandleJunction, i, spline.P0)
+		consider(MoveHandleJunction, i, spline.P3)
+		if spline.ID != handleSplineID {
+			continue
+		}
+		if m, ok := quadraticControlPointForSpline(spline); ok {
+			consider(MoveHandleM, i, m)
+		}
+		consider(MoveHandleP1, i, spline.P1)
+		consider(MoveHandleP2, i, spline.P2)
+	}
+	return best
+}
+
+func moveDisplaySplineID(splines []Spline, draft MoveDraft, hoveredSpline int) int {
+	if draft.Active && draft.Target.SplineID > 0 {
+		return draft.Target.SplineID
+	}
+	if draft.SelectedSplineID > 0 {
+		return draft.SelectedSplineID
+	}
+	if hoveredSpline >= 0 && hoveredSpline < len(splines) {
+		return splines[hoveredSpline].ID
+	}
+	return -1
+}
+
+func applyMoveTarget(original []Spline, target MoveTarget, point Vec2) ([]Spline, bool) {
+	if target.Kind == MoveHandleNone || len(original) == 0 {
+		return original, false
+	}
+	out := append([]Spline(nil), original...)
+	changed := false
+
+	switch target.Kind {
+	case MoveHandleJunction:
+		for i, spline := range original {
+			p0, p1, p2, p3 := spline.P0, spline.P1, spline.P2, spline.P3
+			moved := false
+			if nodeKeyFromVec2(spline.P0) == target.NodeKey {
+				delta := vecSub(point, spline.P0)
+				p0 = point
+				p1 = vecAdd(spline.P1, delta)
+				moved = true
+			}
+			if nodeKeyFromVec2(spline.P3) == target.NodeKey {
+				delta := vecSub(point, spline.P3)
+				p2 = vecAdd(spline.P2, delta)
+				p3 = point
+				moved = true
+			}
+			if moved {
+				out[i] = rebuildSplineWithPoints(spline, p0, p1, p2, p3)
+				changed = true
+			}
+		}
+	case MoveHandleP1, MoveHandleP2, MoveHandleM:
+		idx := findSplineIndexByID(original, target.SplineID)
+		if idx < 0 {
+			return out, false
+		}
+		spline := original[idx]
+		p0, p1, p2, p3 := spline.P0, spline.P1, spline.P2, spline.P3
+		switch target.Kind {
+		case MoveHandleP1:
+			p1 = point
+		case MoveHandleP2:
+			p2 = point
+		case MoveHandleM:
+			p1 = vecAdd(p0, vecScale(vecSub(point, p0), 2.0/3.0))
+			p2 = vecAdd(p3, vecScale(vecSub(point, p3), 2.0/3.0))
+		}
+		out[idx] = rebuildSplineWithPoints(spline, p0, p1, p2, p3)
+		changed = true
+	}
+
+	return out, changed
+}
+
+func applyConnectedTangentHandles(out []Spline, original []Spline, nodeKey simpkg.NodeKey, pivot, tangent Vec2, sourceSplineID int) ([]Spline, bool) {
+	if vectorLengthSq(tangent) <= 1e-9 {
+		return out, false
+	}
+	dir := normalize(tangent)
+	changed := false
+	for i, spline := range original {
+		if spline.ID == sourceSplineID {
+			continue
+		}
+		p0, p1, p2, p3 := out[i].P0, out[i].P1, out[i].P2, out[i].P3
+		moved := false
+		if nodeKeyFromVec2(spline.P0) == nodeKey {
+			radius := sqrtfLocal(distSq(spline.P0, spline.P1))
+			p1 = vecAdd(pivot, vecScale(dir, radius))
+			moved = true
+		}
+		if nodeKeyFromVec2(spline.P3) == nodeKey {
+			radius := sqrtfLocal(distSq(spline.P3, spline.P2))
+			p2 = vecSub(pivot, vecScale(dir, radius))
+			moved = true
+		}
+		if moved {
+			out[i] = rebuildSplineWithPoints(out[i], p0, p1, p2, p3)
+			changed = true
+		}
+	}
+	return out, changed
+}
+
+func applyMoveTargetWithConstraints(original []Spline, target MoveTarget, point Vec2) ([]Spline, bool) {
+	if target.Kind == MoveHandleNone || len(original) == 0 {
+		return original, false
+	}
+	out, changed := applyMoveTarget(original, target, point)
+	if !changed {
+		return out, false
+	}
+
+	idx := findSplineIndexByID(original, target.SplineID)
+	if idx < 0 {
+		return out, changed
+	}
+	spline := original[idx]
+	switch target.Kind {
+	case MoveHandleP1:
+		pivot := spline.P0
+		nodeKey := nodeKeyFromVec2(pivot)
+		var tangentChanged bool
+		out, tangentChanged = applyConnectedTangentHandles(out, original, nodeKey, pivot, vecSub(point, pivot), target.SplineID)
+		changed = changed || tangentChanged
+	case MoveHandleP2:
+		pivot := spline.P3
+		nodeKey := nodeKeyFromVec2(pivot)
+		var tangentChanged bool
+		out, tangentChanged = applyConnectedTangentHandles(out, original, nodeKey, pivot, vecSub(pivot, point), target.SplineID)
+		changed = changed || tangentChanged
+	case MoveHandleM:
+		moved := out[idx]
+		var tangentChanged bool
+		out, tangentChanged = applyConnectedTangentHandles(out, original, nodeKeyFromVec2(spline.P0), spline.P0, vecSub(moved.P1, spline.P0), target.SplineID)
+		changed = changed || tangentChanged
+		out, tangentChanged = applyConnectedTangentHandles(out, original, nodeKeyFromVec2(spline.P3), spline.P3, vecSub(spline.P3, moved.P2), target.SplineID)
+		changed = changed || tangentChanged
+	}
+	return out, changed
+}
+
+func handleMoveMode(draft MoveDraft, splines []Spline, hoveredSpline int, mouseWorld Vec2, zoom float32) (MoveDraft, []Spline, bool) {
+	if draft.Active && (rl.IsKeyPressed(rl.KeyEscape) || rl.IsMouseButtonPressed(rl.MouseButtonRight)) {
+		restored := append([]Spline(nil), draft.OriginalSplines...)
+		cancelled := newMoveDraft()
+		cancelled.SelectedSplineID = draft.SelectedSplineID
+		return cancelled, restored, true
+	}
+
+	if !draft.Active && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		handleSplineID := moveDisplaySplineID(splines, draft, hoveredSpline)
+		target := findMoveTarget(splines, mouseWorld, pixelsToWorld(zoom, 12), handleSplineID)
+		if target.Kind != MoveHandleNone {
+			draft = MoveDraft{
+				Active:           true,
+				SelectedSplineID: target.SplineID,
+				Target:           target,
+				OriginalSplines:  append([]Spline(nil), splines...),
+				GrabOffset:       vecSub(target.Point, mouseWorld),
+				CurrentPoint:     target.Point,
+			}
+		} else if hoveredSpline >= 0 && hoveredSpline < len(splines) {
+			draft.SelectedSplineID = splines[hoveredSpline].ID
+		} else {
+			draft.SelectedSplineID = -1
+		}
+	}
+
+	if !draft.Active {
+		return draft, splines, false
+	}
+
+	rawPoint := vecAdd(mouseWorld, draft.GrabOffset)
+	referenceSplines := draft.OriginalSplines
+	if len(referenceSplines) == 0 {
+		referenceSplines = splines
+	}
+	movePoint, snap := applySplineToolSnap(rawPoint, referenceSplines, zoom)
+	updated, changed := applyMoveTargetWithConstraints(draft.OriginalSplines, draft.Target, movePoint)
+	draft.CurrentPoint = movePoint
+	draft.Snap = snap
+
+	if rl.IsMouseButtonReleased(rl.MouseButtonLeft) {
+		draft.Active = false
+		draft.OriginalSplines = nil
+		draft.Snap = GeometrySnap{}
+	}
+	return draft, updated, changed
 }
 
 // ---------- traffic light mode handlers ----------
@@ -4079,6 +4379,65 @@ func drawLaneChangeSplines(lcs []Spline, zoom float32) {
 	}
 }
 
+func drawMoveTargetHighlight(target MoveTarget, point Vec2, zoom float32, color Color) {
+	if target.Kind == MoveHandleNone {
+		return
+	}
+	r := pixelsToWorld(zoom, 9)
+	switch target.Kind {
+	case MoveHandleJunction:
+		drawRing(point, r*0.65, r*1.25, 0, 360, 24, color)
+	case MoveHandleM:
+		drawRing(point, r*0.45, r, 0, 360, 24, color)
+		drawCircleV(point, r*0.35, color)
+	case MoveHandleP1, MoveHandleP2:
+		drawRing(point, r*0.45, r, 0, 360, 18, color)
+	default:
+		drawRing(point, r*0.45, r, 0, 360, 18, color)
+	}
+}
+
+func drawMoveMode(splines []Spline, draft MoveDraft, hoveredSpline int, mouseWorld Vec2, zoom float32, viewRect worldRect) {
+	armColor := NewColor(80, 90, 110, 135)
+	handleColor := NewColor(235, 138, 60, 220)
+	mColor := NewColor(70, 185, 165, 230)
+	hoverColor := NewColor(255, 204, 64, 245)
+	activeColor := NewColor(230, 72, 72, 245)
+	armThick := pixelsToWorld(zoom, 1.3)
+	handleR := pixelsToWorld(zoom, 4.5)
+
+	displaySplineID := moveDisplaySplineID(splines, draft, hoveredSpline)
+	for _, spline := range splines {
+		if spline.ID != displaySplineID {
+			continue
+		}
+		if !splineVisibleInWorldRect(spline, viewRect) {
+			continue
+		}
+		drawSpline(spline, pixelsToWorld(zoom, 4), NewColor(255, 190, 55, 145))
+		drawLineEx(spline.P0, spline.P1, armThick, armColor)
+		drawLineEx(spline.P3, spline.P2, armThick, armColor)
+		drawCircleV(spline.P1, handleR, handleColor)
+		drawCircleV(spline.P2, handleR, handleColor)
+		if m, ok := quadraticControlPointForSpline(spline); ok {
+			drawLineEx(spline.P0, m, armThick, NewColor(35, 145, 130, 115))
+			drawLineEx(m, spline.P3, armThick, NewColor(35, 145, 130, 115))
+			drawCircleV(m, handleR*1.15, mColor)
+		}
+	}
+
+	if draft.Active {
+		drawGeometrySnapHint(draft.Snap, draft.CurrentPoint, zoom)
+		drawMoveTargetHighlight(draft.Target, draft.CurrentPoint, zoom, activeColor)
+		return
+	}
+
+	hovered := findMoveTarget(splines, mouseWorld, pixelsToWorld(zoom, 12), displaySplineID)
+	if hovered.Kind != MoveHandleNone {
+		drawMoveTargetHighlight(hovered, hovered.Point, zoom, hoverColor)
+	}
+}
+
 // drawTurnLinkMode visualises authored turn links as directional arrows
 // from the source spline's midpoint to the target spline's start, colour
 // coded by direction. Highlights the hovered spline and the first-selected
@@ -5227,6 +5586,8 @@ func modeStatusText(mode EditorMode, tool EditorTool, stage Stage, draft Draft, 
 		default:
 			return "Quadratic tool"
 		}
+	case ToolMove:
+		return "Click a spline to select it, then drag a junction, P1/P2 handle, or quadratic M point"
 	case ToolReverse:
 		return "Left click a spline to reverse its direction"
 	case ToolRouteCars:
@@ -5311,6 +5672,8 @@ func toolName(tool EditorTool) string {
 		return "Spline"
 	case ToolQuadratic:
 		return "Quadratic"
+	case ToolMove:
+		return "Move"
 	case ToolCut:
 		return "Cut"
 	case ToolReverse:
@@ -5362,6 +5725,14 @@ func hudInfoLines(mode EditorMode, tool EditorTool, stage Stage, draft Draft, qu
 			"Continuation: clicking an existing endpoint can start from it, mirror M from a previous spline, or finish into another spline when the required axes are compatible.",
 			"Geometry snap: hold Shift to snap P0, M, or P3 to nearby geometry axes. Hold Ctrl+Shift for axis snapping with 4 m steps. Left Alt on a snapped point constrains the next free point perpendicularly.",
 			"If the current combination of previous and next spline axes is impossible for a quadratic spline, the editor will warn instead of creating invalid geometry.",
+		)
+	case ToolMove:
+		controls = append(controls,
+			"Move tool: click a spline to select it, then drag spline junctions, cubic P1/P2 handles, or quadratic M handles to correct existing road geometry.",
+			"Junction drags move every spline endpoint sharing that snapped node and carry the adjacent tangent handles with it.",
+			"Moving P1, P2, or M rotates connected endpoint handles around their own pivot to preserve derivative direction while keeping their handle lengths.",
+			"Hold Ctrl to snap the moved point to the 4 m grid. Hold Shift to snap it to nearby spline-derived geometry axes.",
+			"Right click or Escape cancels the active drag and restores the original geometry.",
 		)
 	case ToolCut:
 		controls = append(controls,
