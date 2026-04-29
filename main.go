@@ -52,6 +52,7 @@ const (
 const (
 	ToolSpline EditorTool = iota
 	ToolQuadratic
+	ToolLine
 	ToolMove
 	ToolCut
 	ToolReverse
@@ -374,6 +375,10 @@ type QuadraticDraft struct {
 	PerpLockAxisDir Vec2
 }
 
+type LineDraft struct {
+	P0 Vec2
+}
+
 // CutDraft holds state for the spline-cut mode.
 // Stage StageIdle   → user is hovering, snap dot follows nearest spline point.
 // Stage StageSetP1  → cut point is locked; user places the tangent handle.
@@ -626,6 +631,7 @@ var modeToolbarItems = []modeToolbarItem{
 var drawToolItems = []toolToolbarItem{
 	{"E", "Spline", ToolSpline},
 	{"Q", "Quad", ToolQuadratic},
+	{"F", "Line", ToolLine},
 	{"M", "Move", ToolMove},
 	{"C", "Cut", ToolCut},
 	{"X", "Rev", ToolReverse},
@@ -702,7 +708,7 @@ func toolsForMode(mode EditorMode) []toolToolbarItem {
 
 func modeForTool(tool EditorTool) EditorMode {
 	switch tool {
-	case ToolSpline, ToolQuadratic, ToolMove, ToolCut, ToolReverse:
+	case ToolSpline, ToolQuadratic, ToolLine, ToolMove, ToolCut, ToolReverse:
 		return ModeDraw
 	case ToolPriority, ToolCouple, ToolTurnLink, ToolSpeedLimit, ToolPreference:
 		return ModeRules
@@ -814,6 +820,7 @@ func main() {
 	stage := StageIdle
 	draft := newDraft()
 	quadraticDraft := newQuadraticDraft()
+	lineDraft := newLineDraft()
 	cutDraft := newCutDraft()
 	moveDraft := newMoveDraft()
 	pedestrianDraft := pedestrianPathDraft{}
@@ -848,6 +855,7 @@ func main() {
 		stage = StageIdle
 		draft = newDraft()
 		quadraticDraft = newQuadraticDraft()
+		lineDraft = newLineDraft()
 		cutDraft = newCutDraft()
 		moveDraft = newMoveDraft()
 		pedestrianDraft = pedestrianPathDraft{}
@@ -923,6 +931,9 @@ func main() {
 		}
 		if rl.IsKeyPressed(rl.KeyQ) {
 			setTool(ToolQuadratic)
+		}
+		if rl.IsKeyPressed(rl.KeyF) {
+			setTool(ToolLine)
 		}
 		if rl.IsKeyPressed(rl.KeyM) {
 			setTool(ToolMove)
@@ -1359,6 +1370,20 @@ func main() {
 				if notice != "" {
 					noticeText = notice
 					noticeTimer = 3.0
+				}
+			case ToolLine:
+				var topologyChanged bool
+				stage, lineDraft, splines, nextSplineID, topologyChanged = handleLineMode(stage, lineDraft, splines, hoveredSpline, hoveredNode, splineToolMouse, nextSplineID)
+				if topologyChanged {
+					editorState.Splines = splines
+					editorState.Routes = routes
+					editorState.Cars = cars
+					editorState.LaneChangeSplines = laneChangeSplines
+					editorState.handleTopologyChanged()
+					routes = editorState.Routes
+					cars = editorState.Cars
+					laneChangeSplines = editorState.LaneChangeSplines
+					editorMutatedWorld = true
 				}
 			case ToolMove:
 				var graphChanged bool
@@ -1910,7 +1935,7 @@ func main() {
 				thickness = maxf(thickness, pixelsToWorld(camera.Zoom, 4))
 			}
 			if i == hoveredSpline {
-				if ((tool == ToolSpline || tool == ToolQuadratic) && stage == StageIdle) || tool == ToolPriority || tool == ToolMove {
+				if ((tool == ToolSpline || tool == ToolQuadratic || tool == ToolLine) && stage == StageIdle) || tool == ToolPriority || tool == ToolMove {
 					color = NewColor(242, 153, 74, 255)
 					thickness = pixelsToWorld(camera.Zoom, 5)
 				}
@@ -1924,7 +1949,7 @@ func main() {
 		if tool == ToolReverse {
 			drawSplineDirectionArrows(splines, camera.Zoom, viewRect)
 		}
-		if geometrySnap.Active && geometrySnap.SourceSplineIndex >= 0 && (tool == ToolSpline || tool == ToolQuadratic) {
+		if geometrySnap.Active && geometrySnap.SourceSplineIndex >= 0 && (tool == ToolSpline || tool == ToolQuadratic || tool == ToolLine) {
 			drawSpline(splines[geometrySnap.SourceSplineIndex], pixelsToWorld(camera.Zoom, 4), NewColor(74, 196, 186, 200))
 		}
 
@@ -1968,6 +1993,25 @@ func main() {
 				drawGeometrySnapHint(geometrySnap, previewMouse, camera.Zoom)
 				drawQuadraticSnapHint(stage, quadraticDraft, hoveredNode, splines, previewMouse, camera.Zoom)
 				drawQuadraticDraft(stage, quadraticDraft, previewMouse, camera.Zoom, geometrySnap)
+				drawSpline(preview, pixelsToWorld(camera.Zoom, 4), NewColor(214, 76, 76, 255))
+			}
+		}
+		if tool == ToolLine {
+			if stage == StageIdle {
+				drawGeometrySnapHint(geometrySnap, splineToolMouse, camera.Zoom)
+				if geometrySnap.Active {
+					drawEndpoint(splineToolMouse, handleRadius*1.35, NewColor(74, 196, 186, 235))
+				}
+			}
+			if hoveredNode.SplineIndex >= 0 && (stage == StageIdle || stage == StageSetP1) {
+				drawEndpoint(hoveredNode.Point, handleRadius*1.5, NewColor(255, 196, 61, 255))
+			}
+
+			previewMouse := splineToolMouse
+			preview, hasPreview := buildLinePreview(stage, lineDraft, previewMouse, hoveredNode, splines)
+			if hasPreview {
+				drawGeometrySnapHint(geometrySnap, previewMouse, camera.Zoom)
+				drawLineDraft(stage, lineDraft, previewMouse, camera.Zoom, hoveredNode, splines)
 				drawSpline(preview, pixelsToWorld(camera.Zoom, 4), NewColor(214, 76, 76, 255))
 			}
 		}
@@ -2066,6 +2110,12 @@ func main() {
 			previewMouse := splineToolMouse
 			if preview, hasPreview := buildQuadraticPreview(stage, quadraticDraft, previewMouse, geometrySnap, hoveredNode, splines); hasPreview {
 				drawQuadraticDraftInfo(stage, quadraticDraft, previewMouse, geometrySnap, preview, camera)
+			}
+		}
+		if tool == ToolLine {
+			previewMouse := splineToolMouse
+			if preview, hasPreview := buildLinePreview(stage, lineDraft, previewMouse, hoveredNode, splines); hasPreview {
+				drawLineDraftInfo(stage, lineDraft, previewMouse, preview, hoveredNode, splines, camera)
 			}
 		}
 		if tool == ToolSpeedLimit {
@@ -2361,6 +2411,10 @@ func newQuadraticDraft() QuadraticDraft {
 	return QuadraticDraft{}
 }
 
+func newLineDraft() LineDraft {
+	return LineDraft{}
+}
+
 func newMoveDraft() MoveDraft {
 	return MoveDraft{SelectedSplineID: -1}
 }
@@ -2369,6 +2423,13 @@ func newQuadraticSpline(id int, p0, m, p3 Vec2) Spline {
 	p1 := vecAdd(p0, vecScale(vecSub(m, p0), 2.0/3.0))
 	p2 := vecAdd(p3, vecScale(vecSub(m, p3), 2.0/3.0))
 	return simpkg.NewSpline(id, p0, p1, p2, p3)
+}
+
+func lineMidpoint(p0, p3 Vec2) Vec2 {
+	return Vec2{
+		X: (p0.X + p3.X) * 0.5,
+		Y: (p0.Y + p3.Y) * 0.5,
+	}
 }
 
 func quadraticMirroredMFromPrevSpline(prev Spline) Vec2 {
@@ -2525,6 +2586,54 @@ func handleQuadraticMode(stage Stage, draft QuadraticDraft, splines []Spline, ho
 	}
 
 	return stage, draft, splines, nextSplineID, topologyChanged, notice
+}
+
+func handleLineMode(stage Stage, draft LineDraft, splines []Spline, hoveredSpline int, hoveredNode EndHit, mouseWorld Vec2, nextSplineID int) (Stage, LineDraft, []Spline, int, bool) {
+	topologyChanged := false
+
+	if rl.IsMouseButtonPressed(rl.MouseButtonRight) {
+		switch stage {
+		case StageIdle:
+			if hoveredSpline >= 0 {
+				deletedID := splines[hoveredSpline].ID
+				splines = append(splines[:hoveredSpline], splines[hoveredSpline+1:]...)
+				splines = removeSplineFromCouplings(splines, deletedID)
+				topologyChanged = true
+			}
+		case StageSetP1:
+			stage = StageIdle
+			draft = newLineDraft()
+		}
+	}
+
+	if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		switch stage {
+		case StageIdle:
+			draft = newLineDraft()
+			if hoveredNode.SplineIndex >= 0 {
+				draft.P0 = endpointAnchor(splines[hoveredNode.SplineIndex], hoveredNode.Kind)
+			} else {
+				draft.P0 = mouseWorld
+			}
+			stage = StageSetP1
+		case StageSetP1:
+			p3 := mouseWorld
+			if hoveredNode.SplineIndex >= 0 {
+				p3 = endpointAnchor(splines[hoveredNode.SplineIndex], hoveredNode.Kind)
+			}
+			if distSq(draft.P0, p3) <= 1e-9 {
+				break
+			}
+			spline := newQuadraticSpline(nextSplineID, draft.P0, lineMidpoint(draft.P0, p3), p3)
+			nextSplineID++
+			splines = append(splines, spline)
+			stage = StageIdle
+			draft = newLineDraft()
+			topologyChanged = true
+		}
+	}
+
+	return stage, draft, splines, nextSplineID, topologyChanged
 }
 
 func handleEditMode(stage Stage, draft Draft, splines []Spline, hoveredSpline int, hoveredNode EndHit, mouseWorld Vec2, geometrySnap GeometrySnap, nextSplineID int) (Stage, Draft, []Spline, int, bool) {
@@ -5586,6 +5695,11 @@ func modeStatusText(mode EditorMode, tool EditorTool, stage Stage, draft Draft, 
 		default:
 			return "Quadratic tool"
 		}
+	case ToolLine:
+		if stage == StageSetP1 {
+			return "Choose P3"
+		}
+		return "Idle"
 	case ToolMove:
 		return "Click a spline to select it, then drag a junction, P1/P2 handle, or quadratic M point"
 	case ToolReverse:
@@ -5672,6 +5786,8 @@ func toolName(tool EditorTool) string {
 		return "Spline"
 	case ToolQuadratic:
 		return "Quadratic"
+	case ToolLine:
+		return "Line"
 	case ToolMove:
 		return "Move"
 	case ToolCut:
@@ -5725,6 +5841,13 @@ func hudInfoLines(mode EditorMode, tool EditorTool, stage Stage, draft Draft, qu
 			"Continuation: clicking an existing endpoint can start from it, mirror M from a previous spline, or finish into another spline when the required axes are compatible.",
 			"Geometry snap: hold Shift to snap P0, M, or P3 to nearby geometry axes. Hold Ctrl+Shift for axis snapping with 4 m steps. Left Alt on a snapped point constrains the next free point perpendicularly.",
 			"If the current combination of previous and next spline axes is impossible for a quadratic spline, the editor will warn instead of creating invalid geometry.",
+		)
+	case ToolLine:
+		controls = append(controls,
+			"Line tool: left click places P0, second left click places P3. The tool stores the result as a quadratic spline whose middle control point is the midpoint of the drawn segment.",
+			"Clicking an existing spline endpoint uses that exact snapped node, so straight segments can connect cleanly into the road graph.",
+			"Geometry snap: hold Shift to snap either endpoint to nearby spline-derived axes. Hold Ctrl+Shift for axis snapping with 4 m steps.",
+			"Right click deletes the hovered spline while idle or cancels the current draft.",
 		)
 	case ToolMove:
 		controls = append(controls,
@@ -6015,6 +6138,20 @@ func splineDrawColor(s Spline) Color {
 	return NewColor(35, 85, 175, 255)
 }
 
+func buildLinePreview(stage Stage, draft LineDraft, mouse Vec2, hoveredNode EndHit, splines []Spline) (Spline, bool) {
+	if stage != StageSetP1 {
+		return Spline{}, false
+	}
+	p3 := mouse
+	if hoveredNode.SplineIndex >= 0 {
+		p3 = endpointAnchor(splines[hoveredNode.SplineIndex], hoveredNode.Kind)
+	}
+	if distSq(draft.P0, p3) <= 1e-9 {
+		return Spline{}, false
+	}
+	return newQuadraticSpline(-1, draft.P0, lineMidpoint(draft.P0, p3), p3), true
+}
+
 func buildQuadraticPreview(stage Stage, draft QuadraticDraft, mouse Vec2, geometrySnap GeometrySnap, hoveredNode EndHit, splines []Spline) (Spline, bool) {
 	switch stage {
 	case StageSetP1:
@@ -6076,6 +6213,23 @@ func drawQuadraticDraft(stage Stage, draft QuadraticDraft, mouse Vec2, zoom floa
 	}
 }
 
+func drawLineDraft(stage Stage, draft LineDraft, mouse Vec2, zoom float32, hoveredNode EndHit, splines []Spline) {
+	if stage != StageSetP1 {
+		return
+	}
+	lineThickness := pixelsToWorld(zoom, 1.5)
+	handleRadius := pixelsToWorld(zoom, handlePixels)
+	guide := NewColor(140, 140, 140, 255)
+	p3 := mouse
+	if hoveredNode.SplineIndex >= 0 {
+		p3 = endpointAnchor(splines[hoveredNode.SplineIndex], hoveredNode.Kind)
+	}
+
+	drawEndpoint(draft.P0, handleRadius, NewColor(215, 67, 67, 255))
+	drawLineEx(draft.P0, p3, lineThickness, guide)
+	drawEndpoint(p3, handleRadius, NewColor(35, 85, 175, 255))
+}
+
 func drawQuadraticDraftInfo(stage Stage, draft QuadraticDraft, mouseWorld Vec2, geometrySnap GeometrySnap, preview Spline, camera rl.Camera2D) {
 	switch stage {
 	case StageSetP1:
@@ -6089,6 +6243,18 @@ func drawQuadraticDraftInfo(stage Stage, draft QuadraticDraft, mouseWorld Vec2, 
 		}
 		drawArcLabel(preview, camera)
 	}
+}
+
+func drawLineDraftInfo(stage Stage, draft LineDraft, mouseWorld Vec2, preview Spline, hoveredNode EndHit, splines []Spline, camera rl.Camera2D) {
+	if stage != StageSetP1 {
+		return
+	}
+	p3 := mouseWorld
+	if hoveredNode.SplineIndex >= 0 {
+		p3 = endpointAnchor(splines[hoveredNode.SplineIndex], hoveredNode.Kind)
+	}
+	drawSegmentLabel(draft.P0, p3, camera)
+	drawArcLabel(preview, camera)
 }
 
 func drawQuadraticSnapHint(stage Stage, draft QuadraticDraft, hoveredNode EndHit, splines []Spline, mouse Vec2, zoom float32) {
