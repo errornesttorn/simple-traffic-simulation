@@ -1798,6 +1798,16 @@ func main() {
 										showPhaseIdx = -1
 									}
 								}
+								if rl.CheckCollisionPointRec(mouseScreenRL, row.dupBtn) {
+									trafficCycles = trafficDuplicatePhase(trafficCycles, editingCycleID, pi)
+									editorMutatedWorld = true
+									if editingPhaseIdx > pi {
+										editingPhaseIdx++
+									}
+									if showPhaseIdx > pi {
+										showPhaseIdx++
+									}
+								}
 								if rl.CheckCollisionPointRec(mouseScreenRL, row.delBtn) {
 									trafficCycles = trafficDeletePhase(trafficCycles, editingCycleID, pi)
 									editorMutatedWorld = true
@@ -3541,10 +3551,10 @@ func trafficAddPhaseBtnRect(pr rl.Rectangle) rl.Rectangle {
 // phaseRowBtns holds all button/field rects for one phase row.
 // Each row has two sub-rows: (0) label + clearance field + duration field, (1) action buttons.
 type phaseRowBtns struct {
-	clearField               rl.Rectangle
-	durField                 rl.Rectangle
-	upBtn, downBtn           rl.Rectangle
-	showBtn, editBtn, delBtn rl.Rectangle
+	clearField                       rl.Rectangle
+	durField                         rl.Rectangle
+	upBtn, downBtn                   rl.Rectangle
+	showBtn, editBtn, dupBtn, delBtn rl.Rectangle
 }
 
 // getPhaseRowBtns returns the rects for phase row idx inside panel pr.
@@ -3557,11 +3567,12 @@ func getPhaseRowBtns(pr rl.Rectangle, idx int) phaseRowBtns {
 		clearField: rl.NewRectangle(pr.X+pr.Width-127, rowY+2, 45, 20),
 		durField:   rl.NewRectangle(pr.X+pr.Width-66, rowY+2, 48, 20),
 		// sub-row 2: buttons left-to-right
-		upBtn:   rl.NewRectangle(x, rowY+26, 32, 20),
-		downBtn: rl.NewRectangle(x+36, rowY+26, 38, 20),
-		showBtn: rl.NewRectangle(x+84, rowY+26, 36, 20),
-		editBtn: rl.NewRectangle(x+124, rowY+26, 42, 20),
-		delBtn:  rl.NewRectangle(x+170, rowY+26, 44, 20),
+		upBtn:   rl.NewRectangle(x, rowY+26, 28, 20),
+		downBtn: rl.NewRectangle(x+32, rowY+26, 36, 20),
+		showBtn: rl.NewRectangle(x+72, rowY+26, 34, 20),
+		editBtn: rl.NewRectangle(x+110, rowY+26, 36, 20),
+		dupBtn:  rl.NewRectangle(x+150, rowY+26, 36, 20),
+		delBtn:  rl.NewRectangle(x+190, rowY+26, 44, 20),
 	}
 }
 
@@ -3778,10 +3789,11 @@ func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles
 
 			// Sub-row 2: action buttons
 			if cycleOn {
-				// Disabled Up/Down/Edit/Delete
+				// Disabled Up/Down/Edit/Dup/Delete
 				drawSmallBtn(row.upBtn, "Up", disabledBg, disabledFg)
 				drawSmallBtn(row.downBtn, "Down", disabledBg, disabledFg)
 				drawSmallBtn(row.editBtn, "Edit", disabledBg, disabledFg)
+				drawSmallBtn(row.dupBtn, "Dup", disabledBg, disabledFg)
 				drawSmallBtn(row.delBtn, "Delete", disabledBg, disabledFg)
 			} else {
 				upBg := NewColor(200, 200, 205, 255)
@@ -3803,6 +3815,7 @@ func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles
 					editLbl = "Done"
 				}
 				drawSmallBtn(row.editBtn, editLbl, editBg, rl.White)
+				drawSmallBtn(row.dupBtn, "Dup", NewColor(70, 140, 80, 255), rl.White)
 				drawSmallBtn(row.delBtn, "Delete", NewColor(200, 60, 60, 255), rl.White)
 			}
 
@@ -3877,6 +3890,33 @@ func trafficMovePhase(cycles []TrafficCycle, cycleID, idx, dir int) []TrafficCyc
 			break
 		}
 		phases[idx], phases[target] = phases[target], phases[idx]
+		break
+	}
+	return cycles
+}
+
+func trafficDuplicatePhase(cycles []TrafficCycle, cycleID, idx int) []TrafficCycle {
+	for i := range cycles {
+		if cycles[i].ID != cycleID {
+			continue
+		}
+		phases := cycles[i].Phases
+		if idx < 0 || idx >= len(phases) {
+			break
+		}
+		src := phases[idx]
+		dup := TrafficPhase{
+			DurationSecs:          src.DurationSecs,
+			ClearanceDurationSecs: src.ClearanceDurationSecs,
+			GreenLightIDs:         append([]int(nil), src.GreenLightIDs...),
+		}
+		out := make([]TrafficPhase, 0, len(phases)+1)
+		out = append(out, phases[:idx+1]...)
+		out = append(out, dup)
+		out = append(out, phases[idx+1:]...)
+		cycles[i].Phases = out
+		cycles[i].PhaseIndex = 0
+		cycles[i].Timer = 0
 		break
 	}
 	return cycles
@@ -7037,9 +7077,9 @@ var routePalette = []Color{
 }
 
 // hitboxRadius returns the circle radius for a body of the given width.
-// Circles protrude exactly 0.5 m beyond the body's sides.
+// Circles protrude exactly 0.35 m beyond the body's sides.
 func hitboxRadius(width float32) float32 {
-	return width/2 + 0.5
+	return width/2 + 0.35
 }
 
 // hitboxCircleOffsets returns circle-centre offsets along the body heading for
