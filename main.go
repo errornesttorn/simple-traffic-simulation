@@ -380,8 +380,8 @@ type LineDraft struct {
 }
 
 // CutDraft holds state for the spline-cut mode.
-// Stage StageIdle   → user is hovering, snap dot follows nearest spline point.
-// Stage StageSetP1  → cut point is locked; user places the tangent handle.
+// The cut now commits immediately on click, so this remains only as a small
+// placeholder for tool reset symmetry.
 type CutDraft struct {
 	OriginalSplineID       int
 	OriginalSplinePriority bool
@@ -4678,6 +4678,21 @@ func splitBezierAt(p0, p1, p2, p3 Vec2, t float32) ([4]Vec2, [4]Vec2) {
 	return left, right
 }
 
+func copySplitSplineMetadata(original Spline, left, right *Spline) {
+	left.Priority = original.Priority
+	right.Priority = original.Priority
+	left.BusOnly = original.BusOnly
+	right.BusOnly = original.BusOnly
+	left.SpeedLimitKmh = original.SpeedLimitKmh
+	right.SpeedLimitKmh = original.SpeedLimitKmh
+	left.LanePreference = original.LanePreference
+	right.LanePreference = original.LanePreference
+	left.RightTurnLinkIDs = nil
+	left.LeftTurnLinkIDs = nil
+	right.LeftTurnLinkIDs = append([]int(nil), original.LeftTurnLinkIDs...)
+	right.RightTurnLinkIDs = append([]int(nil), original.RightTurnLinkIDs...)
+}
+
 // findNearestSplinePoint searches all precomputed samples across all splines and
 // returns the one closest to pos. Returns splineIndex, sample t (0..1), world position.
 func findNearestSplinePoint(splines []Spline, pos Vec2) (splineIndex int, t float32, point Vec2, found bool) {
@@ -4702,67 +4717,37 @@ func handleCutMode(stage Stage, cd CutDraft, splines []Spline, mouseWorld Vec2, 
 		return StageIdle, newCutDraft(), splines, nextSplineID, false
 	}
 
-	switch stage {
-	case StageIdle:
-		if !rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
-			break
-		}
-		si, t, point, found := findNearestSplinePoint(splines, mouseWorld)
-		if !found {
-			break
-		}
-		spline := splines[si]
-		left, right := splitBezierAt(spline.P0, spline.P1, spline.P2, spline.P3, t)
-		return StageSetP1, CutDraft{
-			OriginalSplineID:       spline.ID,
-			OriginalSplinePriority: spline.Priority,
-			CutPoint:               point,
-			CutT:                   t,
-			LeftP:                  left,
-			RightP:                 right,
-		}, splines, nextSplineID, false
-
-	case StageSetP1:
-		if !rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
-			break
-		}
-		H := mouseWorld
-		mirror := Vec2{X: 2*cd.CutPoint.X - H.X, Y: 2*cd.CutPoint.Y - H.Y}
-
-		// Build the two final splines. Left keeps its P0/P1, gets new P2=mirror.
-		// Right gets new P1=H, keeps its P2/P3.
-		newLeft := simpkg.NewSpline(nextSplineID, cd.LeftP[0], cd.LeftP[1], mirror, cd.LeftP[3])
-		newLeft.Priority = cd.OriginalSplinePriority
-		nextSplineID++
-		newRight := simpkg.NewSpline(nextSplineID, cd.RightP[0], H, cd.RightP[2], cd.RightP[3])
-		newRight.Priority = cd.OriginalSplinePriority
-		nextSplineID++
-
-		// Remove original spline (find by ID in case slice shifted).
-		idx := findSplineIndexByID(splines, cd.OriginalSplineID)
-		if idx >= 0 {
-			splines = removeSplineFromCouplings(splines, cd.OriginalSplineID)
-			splines = append(splines[:idx], splines[idx+1:]...)
-		}
-		splines = append(splines, newLeft, newRight)
-
-		return StageIdle, newCutDraft(), splines, nextSplineID, true
+	if !rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		return stage, cd, splines, nextSplineID, false
 	}
 
-	return stage, cd, splines, nextSplineID, false
+	si, t, _, found := findNearestSplinePoint(splines, mouseWorld)
+	if !found {
+		return stage, cd, splines, nextSplineID, false
+	}
+	original := splines[si]
+	left, right := splitBezierAt(original.P0, original.P1, original.P2, original.P3, t)
+	newLeft := simpkg.NewSpline(nextSplineID, left[0], left[1], left[2], left[3])
+	nextSplineID++
+	newRight := simpkg.NewSpline(nextSplineID, right[0], right[1], right[2], right[3])
+	nextSplineID++
+	copySplitSplineMetadata(original, &newLeft, &newRight)
+
+	idx := findSplineIndexByID(splines, original.ID)
+	if idx >= 0 {
+		splines = removeSplineFromCouplings(splines, original.ID)
+		splines = append(splines[:idx], splines[idx+1:]...)
+	}
+	splines = append(splines, newLeft, newRight)
+
+	return StageIdle, newCutDraft(), splines, nextSplineID, true
 }
 
 func drawCutMode(stage Stage, cd CutDraft, splines []Spline, mouseWorld Vec2, zoom float32) {
 	snapColor := NewColor(255, 180, 0, 255)
-	handleColor := NewColor(255, 220, 60, 220)
-	leftColor := NewColor(80, 210, 120, 255)
-	rightColor := NewColor(80, 140, 230, 255)
-	thickness := pixelsToWorld(zoom, 3)
-	handleR := pixelsToWorld(zoom, 5)
 	snapR := pixelsToWorld(zoom, 8)
 
-	switch stage {
-	case StageIdle:
+	if stage == StageIdle {
 		// Snap dot follows the nearest point on any spline.
 		_, _, point, found := findNearestSplinePoint(splines, mouseWorld)
 		if found {
@@ -4772,26 +4757,8 @@ func drawCutMode(stage Stage, cd CutDraft, splines []Spline, mouseWorld Vec2, zo
 			drawLineEx(Vec2{X: point.X - arm, Y: point.Y}, Vec2{X: point.X + arm, Y: point.Y}, pixelsToWorld(zoom, 1.5), snapColor)
 			drawLineEx(Vec2{X: point.X, Y: point.Y - arm}, Vec2{X: point.X, Y: point.Y + arm}, pixelsToWorld(zoom, 1.5), snapColor)
 		}
-
-	case StageSetP1:
-		H := mouseWorld
-		mirror := Vec2{X: 2*cd.CutPoint.X - H.X, Y: 2*cd.CutPoint.Y - H.Y}
-
-		// Preview left spline (green): original P0/P1, new P2=mirror, cut point.
-		previewLeft := simpkg.NewSpline(0, cd.LeftP[0], cd.LeftP[1], mirror, cd.LeftP[3])
-		// Preview right spline (blue): cut point, H, original P2, original P3.
-		previewRight := simpkg.NewSpline(0, cd.RightP[0], H, cd.RightP[2], cd.RightP[3])
-
-		drawSpline(previewLeft, thickness, leftColor)
-		drawSpline(previewRight, thickness, rightColor)
-
-		// Handle lines from cut point to both control handles.
-		drawLineEx(cd.CutPoint, H, pixelsToWorld(zoom, 1.5), handleColor)
-		drawLineEx(cd.CutPoint, mirror, pixelsToWorld(zoom, 1.5), handleColor)
-		drawCircleV(H, handleR, rightColor)
-		drawCircleV(mirror, handleR, leftColor)
-
-		// Cut point marker.
+	}
+	if stage == StageSetP1 {
 		drawCircleV(cd.CutPoint, snapR, snapColor)
 	}
 }
@@ -5726,10 +5693,7 @@ func modeStatusText(mode EditorMode, tool EditorTool, stage Stage, draft Draft, 
 	case ToolTurnLink:
 		return "Click source spline, then left click target for right-turn link, right click for left-turn link  (Esc cancels)"
 	case ToolCut:
-		if stage == StageSetP1 {
-			return "Place tangent handle at cut point  (right-click cancels)"
-		}
-		return "Click a spline to cut it"
+		return "Click a spline to cut it into two matching halves"
 	case ToolSpeedLimit:
 		return "Left click: apply speed limit   Right click: remove"
 	case ToolPreference:
@@ -5859,8 +5823,8 @@ func hudInfoLines(mode EditorMode, tool EditorTool, stage Stage, draft Draft, qu
 		)
 	case ToolCut:
 		controls = append(controls,
-			"Cut tool: left click a spline to pick the cut point, then place the tangent handle. Right click cancels.",
-			"The spline is split into two new splines that preserve the original curve shape around the cut.",
+			"Cut tool: left click a spline to split it at the nearest point. Right click or Escape cancels.",
+			"The split uses the exact de Casteljau subdivision of the original cubic, so both resulting splines keep the original curve shape.",
 		)
 	case ToolReverse:
 		controls = append(controls,
