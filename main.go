@@ -376,7 +376,9 @@ type QuadraticDraft struct {
 }
 
 type LineDraft struct {
-	P0 Vec2
+	P0           Vec2
+	FromPrevAxis bool
+	PrevAxisDir  Vec2
 }
 
 // CutDraft holds state for the spline-cut mode.
@@ -2432,6 +2434,25 @@ func lineMidpoint(p0, p3 Vec2) Vec2 {
 	}
 }
 
+func lineControlPoint(draft LineDraft, p3 Vec2, hoveredNode EndHit, splines []Spline) Vec2 {
+	mid := lineMidpoint(draft.P0, p3)
+	if hoveredNode.SplineIndex >= 0 && hoveredNode.SplineIndex < len(splines) {
+		next := splines[hoveredNode.SplineIndex]
+		nextAxis := endpointAxisDir(next, hoveredNode.Kind)
+		if draft.FromPrevAxis {
+			if m, ok := lineIntersection(draft.P0, draft.PrevAxisDir, p3, nextAxis); ok {
+				return m
+			}
+			return projectPointOntoAxis(mid, draft.P0, draft.PrevAxisDir)
+		}
+		return projectPointOntoAxis(mid, p3, nextAxis)
+	}
+	if draft.FromPrevAxis {
+		return projectPointOntoAxis(mid, draft.P0, draft.PrevAxisDir)
+	}
+	return mid
+}
+
 func quadraticMirroredMFromPrevSpline(prev Spline) Vec2 {
 	return vecAdd(prev.P3, vecSub(prev.P3, prev.P2))
 }
@@ -2611,7 +2632,10 @@ func handleLineMode(stage Stage, draft LineDraft, splines []Spline, hoveredSplin
 		case StageIdle:
 			draft = newLineDraft()
 			if hoveredNode.SplineIndex >= 0 {
-				draft.P0 = endpointAnchor(splines[hoveredNode.SplineIndex], hoveredNode.Kind)
+				prev := splines[hoveredNode.SplineIndex]
+				draft.P0 = endpointAnchor(prev, hoveredNode.Kind)
+				draft.FromPrevAxis = true
+				draft.PrevAxisDir = endpointAxisDir(prev, hoveredNode.Kind)
 			} else {
 				draft.P0 = mouseWorld
 			}
@@ -2624,7 +2648,7 @@ func handleLineMode(stage Stage, draft LineDraft, splines []Spline, hoveredSplin
 			if distSq(draft.P0, p3) <= 1e-9 {
 				break
 			}
-			spline := newQuadraticSpline(nextSplineID, draft.P0, lineMidpoint(draft.P0, p3), p3)
+			spline := newQuadraticSpline(nextSplineID, draft.P0, lineControlPoint(draft, p3, hoveredNode, splines), p3)
 			nextSplineID++
 			splines = append(splines, spline)
 			stage = StageIdle
@@ -5809,7 +5833,7 @@ func hudInfoLines(mode EditorMode, tool EditorTool, stage Stage, draft Draft, qu
 	case ToolLine:
 		controls = append(controls,
 			"Line tool: left click places P0, second left click places P3. The tool stores the result as a quadratic spline whose middle control point is the midpoint of the drawn segment.",
-			"Clicking an existing spline endpoint uses that exact snapped node, so straight segments can connect cleanly into the road graph.",
+			"Clicking an existing spline endpoint uses that exact snapped node, and connected endpoints bias the quadratic control point so the join direction stays aligned.",
 			"Geometry snap: hold Shift to snap either endpoint to nearby spline-derived axes. Hold Ctrl+Shift for axis snapping with 4 m steps.",
 			"Right click deletes the hovered spline while idle or cancels the current draft.",
 		)
@@ -6113,7 +6137,7 @@ func buildLinePreview(stage Stage, draft LineDraft, mouse Vec2, hoveredNode EndH
 	if distSq(draft.P0, p3) <= 1e-9 {
 		return Spline{}, false
 	}
-	return newQuadraticSpline(-1, draft.P0, lineMidpoint(draft.P0, p3), p3), true
+	return newQuadraticSpline(-1, draft.P0, lineControlPoint(draft, p3, hoveredNode, splines), p3), true
 }
 
 func buildQuadraticPreview(stage Stage, draft QuadraticDraft, mouse Vec2, geometrySnap GeometrySnap, hoveredNode EndHit, splines []Spline) (Spline, bool) {
