@@ -2173,53 +2173,57 @@ func main() {
 		if mode == ModeDriving && playerCar.Active {
 			drawPlayerCarScreen(playerCar, camera.Zoom)
 		}
-		drawDirectionWarningLabels(directionWarnings, camera, viewRect)
-
-		drawScaleBar(camera.Zoom)
-		if tool == ToolSpline {
-			previewMouse := splineToolMouse
-			if preview, hasPreview := buildPreview(stage, draft, previewMouse, geometrySnap, hoveredNode, splines); hasPreview {
-				drawDraftInfo(stage, draft, previewMouse, geometrySnap, preview, camera)
-			}
-		}
-		if tool == ToolQuadratic {
-			previewMouse := splineToolMouse
-			if preview, hasPreview := buildQuadraticPreview(stage, quadraticDraft, previewMouse, geometrySnap, hoveredNode, splines); hasPreview {
-				drawQuadraticDraftInfo(stage, quadraticDraft, previewMouse, geometrySnap, preview, camera)
-			}
-		}
-		if tool == ToolLine {
-			previewMouse := splineToolMouse
-			if preview, hasPreview := buildLinePreview(stage, lineDraft, previewMouse, hoveredNode, splines); hasPreview {
-				drawLineDraftInfo(stage, lineDraft, previewMouse, preview, hoveredNode, splines, camera)
-			}
-		}
 		if tool == ToolSpeedLimit {
-			drawSpeedLimitLabels(splines, camera, viewRect)
 			drawCarSpeedLabels(cars, allSplines, allSplineIndexByID, camera, viewRect)
 		}
-		if tool == ToolPreference {
-			drawPreferenceLabels(splines, camera, viewRect)
+		if !presentationMode {
+			drawDirectionWarningLabels(directionWarnings, camera, viewRect)
+
+			drawScaleBar(camera.Zoom)
+			if tool == ToolSpline {
+				previewMouse := splineToolMouse
+				if preview, hasPreview := buildPreview(stage, draft, previewMouse, geometrySnap, hoveredNode, splines); hasPreview {
+					drawDraftInfo(stage, draft, previewMouse, geometrySnap, preview, camera)
+				}
+			}
+			if tool == ToolQuadratic {
+				previewMouse := splineToolMouse
+				if preview, hasPreview := buildQuadraticPreview(stage, quadraticDraft, previewMouse, geometrySnap, hoveredNode, splines); hasPreview {
+					drawQuadraticDraftInfo(stage, quadraticDraft, previewMouse, geometrySnap, preview, camera)
+				}
+			}
+			if tool == ToolLine {
+				previewMouse := splineToolMouse
+				if preview, hasPreview := buildLinePreview(stage, lineDraft, previewMouse, hoveredNode, splines); hasPreview {
+					drawLineDraftInfo(stage, lineDraft, previewMouse, preview, hoveredNode, splines, camera)
+				}
+			}
+			if tool == ToolSpeedLimit {
+				drawSpeedLimitLabels(splines, camera, viewRect)
+			}
+			if tool == ToolPreference {
+				drawPreferenceLabels(splines, camera, viewRect)
+			}
+			drawHud(mode, tool, stage, draft, quadraticDraft, hoveredSpline, routeStartSplineID, coupleModeFirstID, debugMode, hitboxDebugMode, infoMode, paused, camera.Zoom, len(splines), len(routes), len(cars))
+			if profileMode {
+				drawProfilerOverlay(prof)
+			}
+			if tool == ToolTrafficLight {
+				drawTrafficCyclePanel(pendingLights, trafficLights, trafficCycles, editingCycleID, editingLights, editingPhaseIdx, activeDurInput, durInputStr, showPhaseIdx)
+			}
+			if tool == ToolSpeedLimit {
+				drawSpeedLimitPanel(selectedSpeedKmh)
+			}
+			if routePanel.Open {
+				drawRoutePanel(routePanel, routes)
+			}
+			if paused {
+				drawNotice("⏸  Paused  (Space to resume)")
+			} else if noticeText != "" {
+				drawNotice(noticeText)
+			}
+			rl.DrawFPS(int32(rl.GetScreenWidth()-90), 10)
 		}
-		drawHud(mode, tool, stage, draft, quadraticDraft, hoveredSpline, routeStartSplineID, coupleModeFirstID, debugMode, hitboxDebugMode, infoMode, paused, camera.Zoom, len(splines), len(routes), len(cars))
-		if profileMode {
-			drawProfilerOverlay(prof)
-		}
-		if tool == ToolTrafficLight {
-			drawTrafficCyclePanel(pendingLights, trafficLights, trafficCycles, editingCycleID, editingLights, editingPhaseIdx, activeDurInput, durInputStr, showPhaseIdx)
-		}
-		if tool == ToolSpeedLimit {
-			drawSpeedLimitPanel(selectedSpeedKmh)
-		}
-		if routePanel.Open {
-			drawRoutePanel(routePanel, routes)
-		}
-		if paused {
-			drawNotice("⏸  Paused  (Space to resume)")
-		} else if noticeText != "" {
-			drawNotice(noticeText)
-		}
-		rl.DrawFPS(int32(rl.GetScreenWidth()-90), 10)
 		frameProf.drawMS = sinceMS(drawStart)
 		frameProf.frameMS = sinceMS(frameStart)
 		prof.endFrame(frameProf)
@@ -6058,6 +6062,10 @@ func drawInfoBox(title string, x, y, width int32, lines []string) {
 }
 
 func drawHud(mode EditorMode, tool EditorTool, stage Stage, draft Draft, quadraticDraft QuadraticDraft, hoveredSpline int, routeStartSplineID int, coupleModeFirstID int, debugMode bool, hitboxDebugMode bool, infoMode bool, paused bool, zoom float32, splineCount, routeCount, carCount int) {
+	if presentationMode {
+		return
+	}
+
 	mouse := rl.GetMousePosition()
 
 	bgNormal := NewColor(245, 245, 248, 245)
@@ -6120,9 +6128,6 @@ func drawHud(mode EditorMode, tool EditorTool, stage Stage, draft Draft, quadrat
 
 	// Stats — top right
 	stats := fmt.Sprintf("Splines: %d   Routes: %d   Cars: %d   Zoom: %.1f×", splineCount, routeCount, carCount, zoom)
-	if presentationMode {
-		stats += "   Present"
-	}
 	statsW := measureText(stats, 13)
 	drawText(stats, int32(rl.GetScreenWidth())-statsW-12, 14, 13, txtMuted)
 
